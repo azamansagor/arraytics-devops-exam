@@ -1,7 +1,9 @@
 # DevOps Practical Exam — Submission
 
+Repo: https://github.com/azamansagor/arraytics-devops-exam
+
 **Name:** <your full name>
-**Exam Token:** `<paste EXAM_TOKEN here — generate it on the VPS first>`
+**Exam Token:** `root-vmi3536696-1788597274-30dab396`
 **Server IP:** <VPS public IP>
 
 ## Hosted links
