@@ -1,0 +1,7 @@
+Cmnd_Alias MYAPP_ZAMAN = /usr/bin/systemctl restart myapp_zaman, \
+                         /usr/bin/systemctl start myapp_zaman,   \
+                         /usr/bin/systemctl stop myapp_zaman,    \
+                         /usr/bin/systemctl status myapp_zaman,  \
+                         /usr/bin/systemctl is-active myapp_zaman
+%zaman_devs ALL=(root) NOPASSWD: MYAPP_ZAMAN
+%zaman_ops  ALL=(root) NOPASSWD: MYAPP_ZAMAN

@@ -1,0 +1,13 @@
+[Unit]
+Description=myapp_zaman (A1 placeholder, replaced in A4)
+After=network-online.target
+
+[Service]
+User=myappuser_zaman
+WorkingDirectory=/srv/app_zaman
+ExecStart=/usr/bin/python3 -m http.server 3110 --bind 127.0.0.1
+Restart=on-failure
+SyslogIdentifier=myapp_zaman
+
+[Install]
+WantedBy=multi-user.target
