@@ -1,0 +1,24 @@
+# --- secrets: committing any of these = zero for the scenario ---
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+credentials
+.aws/
+secrets/
+id_rsa*
+
+# --- build / runtime junk ---
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+*.log
+!scenario-a/evidence/*.log
+
+# --- os ---
+.DS_Store
+Thumbs.db
