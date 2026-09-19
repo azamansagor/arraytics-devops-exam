@@ -22,3 +22,7 @@ __pycache__/
 # --- os ---
 .DS_Store
 Thumbs.db
+
+# --- AWS keys for exam-deployer (never commit) ---
+*access-key*.json
+*-credentials.txt
