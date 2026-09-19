@@ -231,3 +231,124 @@ it is the evidence for that task, and `exam-deployer-zaman` has no
 | `c2-task49-ecr-push.png` | token + date, caller ARN, `docker images`, `Login Succeeded`, every layer `Pushed`, final digest |
 | `c2-task49-ecr-image-tag-size.png` | token + date, `describe-images` table with tag `v1` and 61,607,847 bytes |
 | `c2-task49-ecr-console.png` | ECR console listing `v1` with its size and type |
+
+### Task 50 — Task definition
+
+Committed at [`ecs/task-definition-zaman.json`](ecs/task-definition-zaman.json) with the
+account id replaced by `ACCOUNT_ID`, substituted with `sed` at register time and rendered
+to `/tmp` rather than back into the repo.
+
+Registered by `exam-deployer-zaman`, which produced `notes-api-zaman:2`.
+
+#### What the task definition contains
+
+| Required | Where |
+| --- | --- |
+| Container from ECR | `notes-api` and `db-init` both run `.../notes-api-zaman:v2` |
+| Port mapping 3000 | `portMappings` on `notes-api` |
+| CloudWatch logs | `awslogs` driver on all three containers, group `/ecs/notes-api-zaman`, one stream prefix each |
+| Container health check | `healthCheck` on `notes-api` (wget `/healthz`) and on `postgres` (`pg_isready`) |
+| DB connection env vars | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_NAME`, `DB_POOL_MAX` in `environment`; `DB_PASSWORD` in `secrets` |
+
+#### Three containers, and the order they have to start in
+
+Postgres runs as a sidecar in the same task. Under `awsvpc` all containers in a task
+share one network namespace, so the app reaches the database at `127.0.0.1:5432` — no
+service discovery, no DNS.
+
+```
+postgres  ──HEALTHY──▶  db-init  ──SUCCESS──▶  notes-api
+```
+
+- `postgres` is essential, with `pg_isready` as its health check.
+- `db-init` runs `node migrate.js && node seed.js` and is **not** essential, so the task
+  survives it exiting. It waits on `condition: HEALTHY`.
+- `notes-api` waits on `condition: SUCCESS`, so it only starts once the schema exists and
+  the data is loaded.
+
+Without that chain the app would open on an empty database and crash-loop, and the
+symptom would look like an application bug rather than a startup ordering one.
+
+`db-init` showing **Stopped, exit code 0** in the console is the expected steady state,
+not a failure. It is also the thing to check first if the app never starts: a non-zero
+exit there means seeding failed and `notes-api` is correctly refusing to come up.
+
+#### Keeping the password out of a committed file
+
+This file is committed, so a literal `POSTGRES_PASSWORD` in it would be a credential in
+the repository — an instant zero for the whole scenario under the exam rules.
+
+The password lives in SSM Parameter Store as a SecureString at
+`/notes-api-zaman/db-password`. The task definition carries only its ARN, in the
+`secrets` block rather than `environment`, and ECS resolves it at task start using the
+execution role. That role's inline policy names the one parameter:
+
+```json
+"Action": "ssm:GetParameters",
+"Resource": "arn:aws:ssm:us-east-1:ACCOUNT_ID:parameter/notes-api-zaman/db-password"
+```
+
+Not `ssm:*`, and not every parameter in the account — the same scoping rule as the C1
+policy. The value never appears in the repo, in the task definition, or in `docker
+inspect` output.
+
+#### Why the container health check uses /healthz and not /readyz
+
+`/readyz` queries the database; `/healthz` only reports that the process is alive.
+
+A container health check is a *restart* trigger. Pointing it at `/readyz` would mean a
+database hiccup marks the container unhealthy and ECS replaces a container that was
+working perfectly — and since the database is a sidecar in the same task, replacing the
+task would destroy the very database it was waiting for. `/readyz` belongs on the load
+balancer target group, where a failing instance is taken out of rotation rather than
+killed. That is where it goes in Task 51.
+
+#### Sizing
+
+512 CPU units and 1024 MiB, above the 256/512 the brief calls sufficient, because this
+task carries Postgres and a seeding run as well as the app. Deliberately not larger:
+half a vCPU is easy to saturate, which is what makes the CPU-driven autoscaling in Task
+52 actually trigger.
+
+#### The honest limitation of the sidecar approach
+
+Each task carries its own Postgres with no volume attached. So:
+
+- the data dies with the task,
+- two tasks behind a load balancer do not share data — each seeds its own copy,
+- every scale-out event pays the seeding cost before the new task can serve traffic.
+
+For a real multi-tenant service this is wrong, and RDS is the right answer: one database,
+many stateless tasks. I chose the sidecar because the brief's cost warning pushes towards
+it and because it keeps the whole scenario inside one task definition. It is a
+demonstration shape, not a production one, and it is worth saying so rather than letting
+it pass as a design.
+
+#### What I got wrong the first time
+
+I ran the task and it worked — in the wrong cluster. ECS had created one named
+`sturdy-bat-1hn1tx` and it was selected by default, so the task landed there instead of
+`exam-cluster-zaman`.
+
+It would have worked fine and failed later. The C1 policy scopes `ecs:UpdateService` to
+`arn:aws:ecs:us-east-1:ACCOUNT_ID:service/exam-cluster-zaman/notes-api-svc-zaman`, so a
+service created in `sturdy-bat-1hn1tx` would have made the CI/CD deploy in Task 53 return
+`AccessDenied` for a reason that looks nothing like a cluster name. Stopped the task,
+created `exam-cluster-zaman` properly as Fargate-only, and re-ran it there.
+
+The general shape of the mistake: an IAM policy ARN encodes names, so every name in it is
+load-bearing. Getting one wrong does not fail where you made the mistake.
+
+#### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c2-task50-register-taskdef.png` | token + date, `register-task-definition` returning family, revision 2, and the three container names |
+| `c2-task50-task-running.png` | `exam-cluster-zaman`, task `Running` and `Healthy` on `notes-api-zaman:2`, Fargate, with the containers listed |
+| `c2-task50-cloudwatch-logs.png` | log group `/ecs/notes-api-zaman`, stream `notes-api/notes-api/3867a73d...`, the app's own startup line |
+| `c2-task50-task-responding.png` | token + date, `/healthz`, `/readyz` returning `ready`, and `/api/stats` returning 30,000 notes |
+
+`/readyz` answering `ready` is the proof the app reached the sidecar Postgres, and
+`notes: 30000` is the proof `db-init` seeded it. The hostname
+`ip-172-31-68-220.ec2.internal` is the same in the CloudWatch line and in the curl
+responses, so both screenshots are demonstrably the same task.
