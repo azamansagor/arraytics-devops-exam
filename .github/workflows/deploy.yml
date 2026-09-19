@@ -1,0 +1,150 @@
+# Exam token: root-vmi3536696-1788597274-30dab396
+#
+# Main-branch pipeline: build the image, tag it with both the git SHA and a
+# version, push it to ECR, then roll the ECS service onto it.
+#
+# There are no AWS credentials anywhere in this repository or in its secrets.
+# The job asks GitHub for a short-lived OIDC token and trades it for temporary
+# AWS credentials; the trust policy on github-actions-deployer-zaman only accepts
+# that token from this repository's main branch or from a gated environment, so a
+# pull request - including one from a fork - cannot reach AWS at all.
+#
+# AWS_ROLE_ARN and AWS_ACCOUNT_ID are held as secrets. Neither is a credential;
+# they are identifiers, kept out of the repo only so the account id is not
+# published, the same reason the committed task definition redacts it.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Safeguard 1 (Task 46): one deploy at a time. Two pushes landing close together
+# would otherwise race - both build, both call UpdateService, and the service ends
+# up on whichever task definition happened to register last, which is not
+# necessarily the newer commit. Queueing here makes the last commit win.
+# cancel-in-progress stays false: cancelling a deploy halfway leaves ECS mid-roll.
+concurrency:
+  group: deploy-ecs-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: notes-api-zaman
+  ECS_CLUSTER: exam-cluster-zaman
+  ECS_SERVICE: notes-api-zaman-service-jgt41c68
+  TASK_FAMILY: notes-api-zaman
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    # Safeguard 2 (Task 46): a hung job cannot burn minutes forever. Without it a
+    # wedged wait-for-service-stability would sit there until GitHub's six-hour
+    # default, holding the concurrency lock and blocking every later deploy.
+    timeout-minutes: 30
+
+    permissions:
+      id-token: write # required to request the OIDC token
+      contents: read
+
+    steps:
+      - name: Show exam token and time
+        run: echo "$EXAM_TOKEN | $(date)"
+        env:
+          EXAM_TOKEN: root-vmi3536696-1788597274-30dab396
+
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm which identity we are running as
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Two tags on one push, as Task 43 asks. The SHA tag is the one that
+      # matters operationally: it is unambiguous, so a running task can always be
+      # traced back to the exact commit that produced it. The version tag is for
+      # humans. 'latest' is deliberately not what the task definition references.
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: scenario-b/app
+          file: scenario-b/docker/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:v1.0.${{ github.run_number }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          # Task 42: layer cache carried between runs by GitHub's cache backend,
+          # so npm ci is not re-run when only application source changed.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Read the live task definition rather than the committed one. The committed
+      # file has ACCOUNT_ID redacted and would drift from whatever is actually
+      # deployed; describing the family means the deploy always starts from the
+      # revision currently in service. The del() strips fields the API returns but
+      # RegisterTaskDefinition rejects.
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query taskDefinition --output json \
+          | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)' \
+          > task-definition.json
+          jq '.containerDefinitions[].name' task-definition.json
+
+      # Both containers run the same image and both have to move together. If only
+      # notes-api were updated, db-init would keep seeding from the old image and
+      # a schema change would silently not be applied.
+      - name: Point notes-api at the new image
+        id: render-api
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: notes-api
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Point db-init at the new image
+        id: render-init
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-api.outputs.task-definition }}
+          container-name: db-init
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # wait-for-service-stability is what turns this from "the API accepted my
+      # request" into "the new version is actually serving". Without it the job
+      # goes green the moment UpdateService returns, which it does before a single
+      # new task has started, let alone passed its health check.
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-init.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 20
+
+      - name: Report what is now running
+        run: |
+          echo "root-vmi3536696-1788597274-30dab396 | $(date)"
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].{taskDefinition:taskDefinition,desired:desiredCount,running:runningCount}' \
+            --output table
