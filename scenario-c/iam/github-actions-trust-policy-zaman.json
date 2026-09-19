@@ -2,7 +2,7 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "OnlyMainBranchOrAGatedEnvironmentOfThisRepo",
+      "Sid": "OnlyMainBranchOrAGatedEnvironmentOfThisRepoById",
       "Effect": "Allow",
       "Principal": {
         "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
@@ -14,8 +14,8 @@
         },
         "StringLike": {
           "token.actions.githubusercontent.com:sub": [
-            "repo:azamansagor/arraytics-devops-exam:ref:refs/heads/main",
-            "repo:azamansagor/arraytics-devops-exam:environment:*"
+            "repo:azamansagor@10332423/arraytics-devops-exam@1357889649:ref:refs/heads/main",
+            "repo:azamansagor@10332423/arraytics-devops-exam@1357889649:environment:*"
           ]
         }
       }

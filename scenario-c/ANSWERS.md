@@ -599,3 +599,118 @@ the bandwidth throttles it before the CPU does.
 | `c2-task52-scale-in.png` | the polling loop returning to `2 2 0` |
 | `c2-task52-alarm-low-history.png` | AlarmLow firing at 23:06:33, 68 seconds before ECS removed the task |
 | `c2-task52-service-health-3-targets.png` | three healthy targets during the scaled-out period, and the 300s grace period |
+
+### Task 53 — Deploy from CI/CD
+
+Workflow: [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml), on push to
+`main`. Build, tag, push to ECR, register a new task definition revision, roll the
+service onto it.
+
+#### No credentials anywhere
+
+There is no `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` in this repository or in its
+secrets. The job asks GitHub for a short-lived OIDC token and exchanges it for temporary
+AWS credentials that expire with the run.
+
+The pipeline proves this about itself. Its third step prints the identity it is actually
+using:
+
+```
+"Arn": "arn:aws:sts::750069566598:assumed-role/github-actions-deployer-zaman/gha-35476207336"
+```
+
+`assumed-role`, not `user` — no key was involved in producing it.
+
+The two repository secrets are `AWS_ROLE_ARN` and `AWS_ACCOUNT_ID`. Neither is a
+credential; both are identifiers, held as secrets only to keep the account id out of a
+public repo. Holding the role ARN grants nothing: assuming it still requires a GitHub
+OIDC token that matches the trust policy.
+
+#### The trust policy, and the subject that does not look like the documentation
+
+```json
+"StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+"StringLike":   { "token.actions.githubusercontent.com:sub": [
+    "repo:azamansagor@10332423/arraytics-devops-exam@1357889649:ref:refs/heads/main",
+    "repo:azamansagor@10332423/arraytics-devops-exam@1357889649:environment:*"
+]}
+```
+
+Two conditions, and both matter. `aud` says the token was minted for AWS and not for some
+other service. `sub` says who may present it: this repository, on `main` or in a gated
+environment. A pull request — a fork's especially — cannot assume this role at all, which
+is the point of not simply allowing `repo:owner/name:*`.
+
+The subject format cost me the most time in this scenario. I first wrote the documented
+form, `repo:azamansagor/arraytics-devops-exam:ref:refs/heads/main`, and every run failed
+with:
+
+```
+Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+That message is the same whether the subject is wrong, the audience is wrong, or the role
+ARN points somewhere else. IAM does not say which condition failed, and correctly so:
+telling an unauthenticated caller which half of the claim was rejected is an oracle for
+guessing the other half.
+
+So rather than change the policy three times on a hunch, I added a step that decodes the
+OIDC token and prints its claims, and compared them against the policy directly:
+
+```json
+{
+  "sub": "repo:azamansagor@10332423/arraytics-devops-exam@1357889649:ref:refs/heads/main",
+  "aud": "sts.amazonaws.com"
+}
+```
+
+GitHub now embeds immutable numeric IDs in the subject — `@10332423` for the owner,
+`@1357889649` for the repository. Names can be changed and re-registered; ids cannot. A
+name-based trust policy would still match if this repository were deleted and someone
+else created one with the same name under a reclaimed account. The id-based form does
+not, so matching it makes the policy stricter rather than looser.
+
+The debugging step stayed in the workflow. It prints claims, never the token, and the
+next person to hit this error gets the answer in one run instead of three.
+
+#### What the deploy does
+
+| Step | Why it is written that way |
+| --- | --- |
+| Build and push | Tagged with the git SHA, `v1.0.<run number>` and `latest`. The task definition references the **SHA**, so a running task always traces back to one commit; `latest` is only a convenience pointer |
+| Download current task definition | Read live from ECS, not from the committed file. The committed copy has the account id redacted and drifts from what is deployed; describing the family always starts from the revision actually in service |
+| Point **both** containers at the new image | `notes-api` and `db-init` run the same image. Updating only the app would leave `db-init` seeding from the old one, so a schema change would silently never be applied |
+| Deploy with `wait-for-service-stability` | Without it the job goes green the moment `UpdateService` returns, which is before a single new task has started, let alone passed a health check |
+
+`Deploy to ECS` took 4m56s of the 5m22s run — that is the new tasks pulling images,
+waiting on `pg_isready`, seeding, and passing two ALB health checks. A green tick that
+arrived in ten seconds would have meant nothing.
+
+Also present, for Task 46: a concurrency group so two pushes cannot race to
+`UpdateService` and leave the service on whichever registered last rather than on the
+newer commit, and `timeout-minutes: 30` so a wedged wait cannot hold that lock until
+GitHub's six-hour default.
+
+#### Result
+
+| Before | After |
+| --- | --- |
+| `notes-api-zaman:2`, deployed by hand from the VPS | `notes-api-zaman:3`, deployed by the pipeline |
+
+```
+taskDefinition  arn:aws:ecs:us-east-1:...:task-definition/notes-api-zaman:3
+desired 2, running 2
+
+tags  ['726af2becab5c628319b70f24735b5cfe2054d7c', 'v1.0.3', 'latest']
+```
+
+And the service kept working across the deploy — `/api/stats` still returns 30,000 notes
+for acme, so the replacement tasks completed their seeding before taking traffic.
+
+#### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c2-task53-trust-policy.png` | the trust policy with its repository condition |
+| `c2-task53-pipeline-success.png` | the green run, the assumed-role ARN, the exam token, and `notes-api-zaman:3` |
+| `c2-task53-new-task-definition-revision.png` | revision 3 in service, and one image carrying the SHA, `v1.0.3` and `latest` |
