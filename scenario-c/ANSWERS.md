@@ -170,3 +170,64 @@ both.
 Honest note: the real-API cross-check above was run in the terminal but not captured as a
 screenshot, so the simulator output is the evidence for this task. The same denials do
 appear, token-stamped, in `c1-task47-denied.png`.
+
+---
+
+## C2 — Get your app running on AWS
+
+### Task 49 — Push your image to ECR
+
+The image is the real Notes API from Scenario B, built from
+[`../scenario-b/docker/Dockerfile`](../scenario-b/docker/Dockerfile), not a placeholder.
+Pushed as `exam-deployer-zaman`, the scoped user from C1 — the caller ARN is printed in
+the screenshot immediately above the push, so this is also the end-to-end proof that the
+policy written in Task 47 permits exactly what it was meant to.
+
+```
+750069566598.dkr.ecr.us-east-1.amazonaws.com/notes-api-zaman:v1
+digest sha256:31c20be1fc51afe5e568cd0518316dcb399fd4091f7dfba3712157b542c0f1a5
+```
+
+#### Tag and size
+
+| Source | Reported size |
+| --- | --- |
+| ECR (`describe-images`, `imageSizeInBytes`) | 61,607,847 bytes |
+| ECR console, `v1` | 61.61 MB |
+| `docker images`, content size | 61.6 MB |
+| `docker images`, disk usage | 245 MB |
+
+The gap between 61.6 MB and 245 MB is not an error and is worth being able to explain:
+**ECR stores and reports compressed layers, while disk usage is the extracted tree.**
+Pulling this image moves about 62 MB over the network and occupies about 245 MB once
+unpacked. Task 22 compares image sizes, so the comparison there has to stay on one side
+of that line rather than mixing the two numbers.
+
+#### Why the repository lists four entries for two images
+
+The console shows `v1` as an **Image Index** plus two untagged rows — one `Image` of the
+same 61.61 MB, and one `Other` of 0.00 MB:
+
+| Tag | Type | Size |
+| --- | --- | --- |
+| `v1` | Image Index | 61.61 MB |
+| – | Image | 61.61 MB |
+| – | Other | 0.00 MB |
+| `c1-permission-test` | Image | 3.63 MB |
+
+BuildKit pushes an OCI image index rather than a bare manifest. The index is what carries
+the `v1` tag; it points at the actual platform image and at a small attestation manifest
+describing how the image was built. The two untagged rows are those referenced objects,
+not duplicate or orphaned uploads — deleting them would break the tag.
+
+`c1-permission-test` is the retagged `alpine` from Task 47, left in place deliberately:
+it is the evidence for that task, and `exam-deployer-zaman` has no
+`ecr:BatchDeleteImage` permission to remove it even if I wanted to.
+
+#### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c2-task49-ecr-push.png` | token + date, caller ARN, `docker images`, `Login Succeeded`, every layer `Pushed`, final digest |
+| `c2-task49-ecr-image-tag-size.png` | token + date, `describe-images` table with tag `v1` and 61,607,847 bytes |
+| `c2-task49-ecr-console.png` | ECR console listing `v1` with its size and type |
