@@ -485,3 +485,117 @@ overlap.
 | `c2-task51-service-running.png` | service Active, 2 desired / 2 running, both tasks Healthy on `notes-api-zaman:2` |
 | `c2-task51-app-through-alb.png` | the real API through the ALB, not just health endpoints |
 | `c2-task51-deployer-can-see-service.png` | `exam-deployer-zaman` calling `describe-services` successfully — the C1 policy and the live service name now agree |
+
+### Task 52 — Autoscaling
+
+Target tracking on `ECSServiceAverageCPUUtilization`, target 50%, min 2, max 6, policy
+`cpu-target-50-zaman`. Creating it produces two CloudWatch alarms automatically, and
+their settings are the whole story of this task:
+
+| Alarm | Condition |
+| --- | --- |
+| `...AlarmHigh` | `CPUUtilization > 50` for **3** datapoints within **3 minutes** |
+| `...AlarmLow` | `CPUUtilization < 45` for **15** datapoints within **15 minutes** |
+
+Scale out on three minutes of evidence, scale in on fifteen. Deliberately asymmetric:
+adding a task you did not need costs a few cents, removing one you did need costs an
+outage. The gap between 45 and 50 is hysteresis, so CPU hovering around the target does
+not flap the service in and out.
+
+#### What actually happened, in UTC
+
+| Time | Event | Source |
+| --- | --- | --- |
+| 22:38:10 | Alarms created with the scaling policy | AlarmHigh history |
+| ~22:43:26 | CPU crosses 50% (first of the three breaching datapoints) | inferred from the 3-of-3 rule |
+| 22:46:26 | `OK → In alarm`, and `Successfully executed action ... policyName:cpu-target-50-zaman` | AlarmHigh history |
+| 22:48:17 | ECS stops a task, deregisters its target | service events |
+| 22:49:29 | ECS starts a task — *"replaced 1 tasks due to an unhealthy status"* | service events |
+| 22:50:18 | New target registered and serving | service events |
+| 22:49:26 | `In alarm → OK` — load over, CPU back down | AlarmHigh history |
+| 23:06:33 | `AlarmLow` fires | AlarmLow |
+| 23:07:41 | ECS stops a task — scale-in | service events |
+| 23:07:51 | Draining finished, steady state at 2 | service events |
+
+Desired count went 2 → 3 → 2, visible in the polling loop as `2 2 0` → `3 2 2` → `3 3 0`
+→ `2 2 0`.
+
+#### How long from CPU going high to a new task serving traffic
+
+| Segment | Duration | Why |
+| --- | --- | --- |
+| CPU crosses 50% → metric usable | ~1 min | ECS publishes CPUUtilization at 1-minute granularity, and a minute has to close before it exists |
+| Metric → alarm fires | ~3 min | 3 of 3 datapoints at 1-minute period |
+| Alarm → ECS starts a task | ~2 min | Application Auto Scaling acts, ECS schedules and places it |
+| Task start → registered in the target group | ~1-2 min | pull two images, wait for `pg_isready`, seed 50,000 notes and 150,000 tags, then pass two consecutive ALB health checks 15s apart |
+| **Total** | **≈ 7 minutes** | 22:43 to 22:50 |
+
+Scale-in is much slower: load stopped around 22:50, `AlarmLow` needed fifteen minutes of
+quiet and fired at 23:06:33, and ECS removed the task 68 seconds later at 23:07:41 —
+**about 18 minutes end to end**.
+
+#### Why this means autoscaling cannot save you from a sudden spike
+
+Seven minutes is the honest answer, and almost none of it is ECS being slow. One minute
+is lost before the metric exists at all, three more proving the spike is not a blip, and
+the rest starting a task. A traffic spike that arrives in thirty seconds is over, or has
+taken the service down, long before the first replacement task is in rotation.
+
+The measurement below made the point better than the arithmetic does. During the load the
+service event log recorded:
+
+> `(service notes-api-zaman-service-jgt41c68) has started 1 tasks. Amazon ECS replaced 1 tasks due to an unhealthy status.`
+
+At sustained 99% CPU the `/readyz` check — which queries Postgres — stopped answering
+inside the target group's 5-second timeout. The task was not broken. It was busy. The ALB
+marked it unhealthy, ECS killed it, and its share of the load moved onto the remaining
+task while a replacement spent minutes seeding before it could help.
+
+That is the shape of the failure autoscaling does not prevent: **while it is still
+gathering evidence, the health checks are already killing the instances that are
+coping.** The spike wins the race.
+
+What actually helps is not faster scaling but not needing it in the moment — capacity
+headroom ahead of a known event, request queueing or rate limiting so overload degrades
+instead of collapsing, a readiness check with a timeout generous enough to survive
+saturation, and fixing the endpoint that burns the CPU. Autoscaling handles the slope of
+a working day. It does not handle a cliff.
+
+#### On the load generator, and on the load itself
+
+The brief suggests `hey`; its S3 download returned 403, so I used ApacheBench, already
+present on the VPS. Same job: `ab -t 300 -n 200000 -c 50 -k`.
+
+Two things about generating this load were not obvious.
+
+**The suggested URL produces no load at all.** The brief's example is
+`/api/search?q=abc` with no headers, and this API requires `X-Tenant`. Without it the app
+returns 400 immediately — no tenant lookup, no query, no CPU. Five minutes at 50
+concurrent would have moved CPU by nothing and the conclusion would have been that
+autoscaling was broken.
+
+**Running the load from Europe against us-east-1 is a bottleneck in itself.** The first
+attempt reached only 20% CPU. At roughly 100ms per round trip, 50 connections without
+keep-alive spend nearly all their time waiting on the network rather than on Postgres —
+91 requests per second, with connection setup as large a cost as processing. Adding `-k`,
+raising concurrency to 200 and switching to `/api/stats` took it to 99%.
+
+`/api/stats` is the better weapon here precisely because of a planted problem: it joins
+all three tables and `tags.note_id` has no index, so every request scans 150,000 rows —
+maximum CPU, and a single-row response, so the transatlantic link never becomes the
+limit. `/api/search` burns CPU too but returns 50 rows per request, and from this distance
+the bandwidth throttles it before the CPU does.
+
+#### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c2-task52-scaling-policy.png` | the policy on the service: target tracking, 50%, min 2 max 6 |
+| `c2-task52-alarm-list.png` | the two `CPUUtilization` alarms on `exam-cluster-zaman`, alongside two unrelated `CapacityProviderReservation` alarms from the stray cluster |
+| `c2-task52-alarm-details.png` | AlarmHigh tied to `policyName:cpu-target-50-zaman`, 3 of 3 datapoints, 1-minute period |
+| `c2-task52-cloudwatch-cpu-spike.png` | CPU reaching 99.57% against the 50% target |
+| `c2-task52-task-count-increased.png` | the polling loop going `2 2 0` → `3 2 2` → `3 3 0` |
+| `c2-task52-scale-out-event.png` | AlarmHigh history: `OK → In alarm` and the scaling action executing, with timestamps |
+| `c2-task52-scale-in.png` | the polling loop returning to `2 2 0` |
+| `c2-task52-alarm-low-history.png` | AlarmLow firing at 23:06:33, 68 seconds before ECS removed the task |
+| `c2-task52-service-health-3-targets.png` | three healthy targets during the scaled-out period, and the 300s grace period |
