@@ -42,7 +42,7 @@ WORKDIR /app
 # never needs a chown layer of its own.
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json ./
-COPY --chown=node:node db.js server.js seed.js schema.sql ./
+COPY --chown=node:node db.js server.js migrate.js seed.js schema.sql ./
 
 USER node
 

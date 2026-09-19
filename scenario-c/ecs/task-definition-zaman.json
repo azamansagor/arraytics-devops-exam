@@ -1,0 +1,110 @@
+{
+  "family": "notes-api-zaman",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "postgres",
+      "image": "postgres:16-alpine",
+      "essential": true,
+      "environment": [
+        { "name": "POSTGRES_USER", "value": "notes" },
+        { "name": "POSTGRES_DB", "value": "notesdb" }
+      ],
+      "secrets": [
+        {
+          "name": "POSTGRES_PASSWORD",
+          "valueFrom": "arn:aws:ssm:us-east-1:ACCOUNT_ID:parameter/notes-api-zaman/db-password"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "pg_isready -U notes -d notesdb || exit 1"],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 5,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/notes-api-zaman",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "postgres"
+        }
+      }
+    },
+    {
+      "name": "db-init",
+      "image": "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/notes-api-zaman:v2",
+      "essential": false,
+      "command": ["sh", "-c", "node migrate.js && node seed.js"],
+      "dependsOn": [{ "containerName": "postgres", "condition": "HEALTHY" }],
+      "environment": [
+        { "name": "DB_HOST", "value": "127.0.0.1" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_USER", "value": "notes" },
+        { "name": "DB_NAME", "value": "notesdb" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:us-east-1:ACCOUNT_ID:parameter/notes-api-zaman/db-password"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/notes-api-zaman",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "db-init"
+        }
+      }
+    },
+    {
+      "name": "notes-api",
+      "image": "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/notes-api-zaman:v2",
+      "essential": true,
+      "dependsOn": [{ "containerName": "db-init", "condition": "SUCCESS" }],
+      "portMappings": [
+        { "containerPort": 3000, "protocol": "tcp", "name": "http" }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "3000" },
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "DB_HOST", "value": "127.0.0.1" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_USER", "value": "notes" },
+        { "name": "DB_NAME", "value": "notesdb" },
+        { "name": "DB_POOL_MAX", "value": "10" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:us-east-1:ACCOUNT_ID:parameter/notes-api-zaman/db-password"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/healthz || exit 1"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/notes-api-zaman",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "notes-api"
+        }
+      }
+    }
+  ]
+}
