@@ -1,0 +1,24 @@
+# The naive single-stage build, written for Task 22 as the thing to measure
+# against. This is what the image looks like if you reach for the defaults.
+#
+#   docker build -f scenario-b/docker/Dockerfile.naive -t notes-api-zaman:naive scenario-b/app
+#
+# Three separate problems, all of them ordinary mistakes:
+#
+#   1. node:22 is the full Debian image - a C toolchain, python, git, man pages.
+#      None of it is used at runtime, all of it ships.
+#   2. COPY . . before npm install, so any source edit invalidates the install
+#      layer and every dependency is fetched again on every build.
+#   3. No USER, so the process runs as root.
+
+FROM node:22
+
+WORKDIR /app
+
+COPY . .
+
+RUN npm install
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]

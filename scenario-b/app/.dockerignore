@@ -1,0 +1,10 @@
+# Keeping these out of the build context matters for more than size: anything
+# copied in lands in a layer and stays there, even if a later layer removes it.
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.env
+.env.*
+*.md
+Dockerfile*
