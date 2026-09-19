@@ -27,9 +27,10 @@ this submission uses the right column.
 | What | URL |
 | --- | --- |
 | App (via nginx) | |
+| Notes API (via AWS ALB) | http://notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com |
 | Grafana dashboard | |
 | GitHub Packages / Docker Hub image | |
-| ALB DNS (Scenario C) | |
+| ALB DNS (Scenario C) | `notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com` |
 | Tenant subdomains | |
 
 ## Repo map

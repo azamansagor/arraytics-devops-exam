@@ -31,7 +31,7 @@
         "ecs:UpdateService",
         "ecs:DescribeServices"
       ],
-      "Resource": "arn:aws:ecs:us-east-1:750069566598:service/exam-cluster-zaman/notes-api-svc-zaman"
+      "Resource": "arn:aws:ecs:us-east-1:750069566598:service/exam-cluster-zaman/notes-api-zaman-service-jgt41c68"
     },
     {
       "Sid": "EcsRegisterTaskDefinitionStarBecauseNoResourceLevelSupport",

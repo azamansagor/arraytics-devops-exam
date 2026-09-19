@@ -12,9 +12,32 @@ This AWS account is shared-safe by suffixing `zaman`, same convention as scenari
 | Account ID | `750069566598` |
 | ECR repository | `notes-api-zaman` |
 | ECS cluster | `exam-cluster-zaman` |
-| ECS service | `notes-api-svc-zaman` |
+| ECS service | `notes-api-zaman-service-jgt41c68` (see note below) |
 | IAM user | `exam-deployer-zaman` |
 | Custom IAM policy | `exam-deployer-policy-zaman` |
+
+### A note on the ECS service name
+
+I planned to call the service `notes-api-svc-zaman`, and that is the name the C1 policy
+and the Task 48 simulator run were written against. When C2 created it, the ECS console
+filled the Service name field with its own default, `notes-api-zaman-service-jgt41c68`,
+and I did not override it.
+
+ECS service names cannot be changed after creation, so the choice was to delete a
+working, healthy service and rebuild it — including re-seeding both tasks — or to point
+the policy at the name that actually exists. I updated the policy, because the name is
+arbitrary and the service is not.
+
+What does not change is the principle: the `Resource` still names one specific service in
+one specific cluster, not `"*"`. The Task 48 evidence shows the ARN as it stood at the
+time of that test; the action, the policy statement and the result are unchanged, only
+the last segment of the ARN differs.
+
+The cost of this shortcut is worth stating: the console's suffix is random, so if this
+service is ever deleted and recreated the name changes again and the policy silently
+stops matching. A deliberate name would not have that property. That is the argument for
+naming things yourself, and it is the second time in this scenario that accepting a
+console default has cost me something — the first was the cluster, in Task 50.
 
 ### Why not `ap-southeast-1`
 
@@ -352,3 +375,113 @@ load-bearing. Getting one wrong does not fail where you made the mistake.
 `notes: 30000` is the proof `db-init` seeded it. The hostname
 `ip-172-31-68-220.ec2.internal` is the same in the CloudWatch line and in the curl
 responses, so both screenshots are demonstrably the same task.
+
+### Task 51 — Service behind a load balancer
+
+```
+http://notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com
+```
+
+An internet-facing ALB on port 80 forwards to target group `notes-api-tg-zaman`, which
+the ECS service registers two Fargate tasks into.
+
+| Piece | Setting |
+| --- | --- |
+| Target group type | **IP** — Fargate uses `awsvpc`, so every task has its own ENI and there is no instance to register |
+| Target port | 3000 |
+| Target group health check | `/readyz`, interval 15s, healthy threshold 2 |
+| Service | `notes-api-zaman-service-jgt41c68`, desired 2, Fargate |
+| Health check grace period | 300s |
+
+#### Proof that requests reach different tasks
+
+Twelve requests through the ALB, and a count over twenty:
+
+```
+{"status":"ok","instance":"ip-172-31-25-251.ec2.internal","uptime":811.69}
+{"status":"ok","instance":"ip-172-31-44-152.ec2.internal","uptime":838.13}
+{"status":"ok","instance":"ip-172-31-44-152.ec2.internal","uptime":839.30}
+{"status":"ok","instance":"ip-172-31-25-251.ec2.internal","uptime":814.37}
+...
+--- distribution over 20 requests ---
+  10 ip-172-31-25-251.ec2.internal
+  10 ip-172-31-44-152.ec2.internal
+```
+
+Ten and ten. The two hostnames are the two task ENI addresses, and they match the two
+registered targets in the target group screenshot — `172.31.25.251` in `us-east-1c` and
+`172.31.44.152` in `us-east-1d`. The `uptime` values also drift independently, which is
+what you would expect from two separate processes and not from one answering twice.
+
+#### Two health checks, two different jobs
+
+This is the part worth being precise about, because the same application exposes both:
+
+| | Endpoint | Consequence of failing |
+| --- | --- | --- |
+| Container health check (task definition) | `/healthz` | ECS **kills and replaces** the container |
+| Target group health check (ALB) | `/readyz` | ALB **stops sending traffic** to that target |
+
+`/readyz` queries the database, `/healthz` does not. A database blip should take an
+instance out of rotation, not destroy it — and here destroying the task would destroy the
+sidecar Postgres along with it. Putting the database-touching check on the load balancer
+and the process-only check on the container is what keeps those two outcomes apart.
+
+#### Security groups: the ALB is the only thing that may reach port 3000
+
+Two groups, chained:
+
+- `notes-api-alb-sg` — inbound HTTP 80 from `0.0.0.0/0`. This is a public API and the URL
+  has to be openable, so that is deliberate. The instant-zero rule concerns port 22,
+  which is not open here at all.
+- `notes-api-zaman-sg` on the tasks — inbound 3000 from **the ALB's security group id**,
+  plus a separate rule from the exam VPS `169.58.246.108/32` for direct debugging.
+
+Port 3000 is not open to the internet. Naming a security group as the source rather than
+a CIDR matters: AWS does not memorise an address, it means "any ENI carrying that group".
+ALB node addresses change and new ones appear as it scales, and AWS gives no guarantee
+about them, so a CIDR rule would need chasing. A group reference follows on its own.
+
+One console detail worth recording: an existing rule whose source is an IPv4 CIDR cannot
+be switched to a group reference — *"You may not specify a referenced group id for an
+existing IPv4 CIDR rule."* It has to be added as a new rule, which is why there are two.
+
+#### Why the grace period is 300 seconds and not the default
+
+The default is 0. A task here needs to pull two images, start Postgres, wait for
+`pg_isready`, then apply the schema and seed 50,000 notes and 150,000 tags before the app
+even listens — roughly 90 to 120 seconds. With a grace period of 0 the ALB starts health
+checking immediately, marks the target unhealthy, ECS replaces the task, and the
+replacement does the same thing forever.
+
+The failure looks exactly like a broken application. It is impatience.
+
+#### The problem I hit: healthy targets receiving no traffic
+
+After creating the service, the target group reported:
+
+> *Targets are not within enabled Availability Zones. Unused target zones: us-east-1c, us-east-1d*
+
+Both targets were registered and both were healthy, and none of them received a request.
+An ALB can only route into Availability Zones it has a subnet in, and I had given the ALB
+two AZs while ECS placed the tasks in two others — the ECS console defaults to every
+subnet in the VPC, so the scheduler used AZs the ALB could not reach.
+
+Fixed by adding all the default VPC's subnets to the ALB (Network mapping → Edit
+subnets), which changes nothing about the running tasks. Restricting the service's
+subnets instead would have worked too, but at the cost of a redeploy and a re-seed.
+
+The shape of this failure is worth remembering because every component reports itself
+healthy: ECS says the tasks are running, the target group says the targets are healthy,
+and the ALB returns 503. Nothing is broken; two lists of Availability Zones simply do not
+overlap.
+
+#### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c2-task51-alb-different-tasks.png` | token + date, twelve alternating responses through the ALB, and a 10/10 split over twenty |
+| `c2-task51-target-group-healthy.png` | target type IP, port 3000, two targets healthy in `us-east-1c` and `us-east-1d` |
+| `c2-task51-service-running.png` | service Active, 2 desired / 2 running, both tasks Healthy on `notes-api-zaman:2` |
+| `c2-task51-app-through-alb.png` | the real API through the ALB, not just health endpoints |
+| `c2-task51-deployer-can-see-service.png` | `exam-deployer-zaman` calling `describe-services` successfully — the C1 policy and the live service name now agree |
