@@ -17,7 +17,7 @@ const INSTANCE = process.env.HOSTNAME || os.hostname();
 // source rather than an environment variable on purpose: the point of that task
 // is to prove the *image* rolled over, and a version that can be changed with
 // --env-add would prove nothing about which build is running.
-const APP_VERSION = '1';
+const APP_VERSION = '2';
 app.use((req, res, next) => {
   res.set('X-Served-By', INSTANCE);
   next();
