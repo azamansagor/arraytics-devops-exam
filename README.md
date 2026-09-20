@@ -27,10 +27,10 @@ this submission uses the right column.
 | What | URL |
 | --- | --- |
 | App (via nginx) | |
-| Notes API (via AWS ALB) | http://notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com |
+| Notes API (via AWS ALB) | `http://notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com` — **deleted in C5 Task 63**, kept here to show what was running. Evidence in `scenario-c/evidence/` |
 | Grafana dashboard | |
 | GitHub Packages / Docker Hub image | |
-| ALB DNS (Scenario C) | `notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com` |
+| ALB DNS (Scenario C) | `notes-api-alb-zaman-1925549638.us-east-1.elb.amazonaws.com` — deleted in C5 |
 | Tenant subdomains | |
 
 ## Repo map

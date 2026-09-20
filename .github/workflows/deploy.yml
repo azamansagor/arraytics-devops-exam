@@ -15,9 +15,13 @@
 
 name: deploy
 
+# Ran on every push to main while the AWS infrastructure existed; the successful
+# run that deployed notes-api-zaman:3 is the evidence for Task 53. C5 then deleted
+# the ECR repository and the ECS service the pipeline targets, so leaving the push
+# trigger on would queue a red run after every later commit, failing for the
+# entirely expected reason that its destination no longer exists. Reduced to
+# manual dispatch rather than deleted, so the workflow itself stays reviewable.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 # Safeguard 1 (Task 46): one deploy at a time. Two pushes landing close together

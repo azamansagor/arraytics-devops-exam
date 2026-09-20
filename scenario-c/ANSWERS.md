@@ -984,3 +984,101 @@ another's.
 | `c3-task56-no-signature.png` | the plain object URL returning AccessDenied |
 | `c3-task57-three-cases.png` | public 200, private 403, same private object presigned 200 |
 | `c3-task58-tenant-isolation.png` | globex 200, acme 403 on the same key, and the near-miss prefix also 403 |
+
+---
+
+## C5 — Clean up
+
+### Task 63 — Delete everything
+
+Deleted in dependency order, because AWS refuses several of these while something
+still references them:
+
+| # | Resource | Note |
+| --- | --- | --- |
+| 1 | ECS service `notes-api-zaman-service-jgt41c68` | force-deleted; the cluster cannot go while a service exists |
+| 2 | ECS cluster `exam-cluster-zaman` | |
+| 3 | ECS cluster `sturdy-bat-1hn1tx` | the console-generated cluster from Task 50's mistake |
+| 4 | ALB `notes-api-alb-zaman` | before its target group, which is still "in use" until the listener goes |
+| 5 | Target group `notes-api-tg-zaman` | |
+| 6 | ECR repository `notes-api-zaman` | with its images |
+| 7 | S3 bucket `notes-api-zaman-uploads` | emptied first — S3 will not delete a bucket with objects in it |
+| 8 | SSM parameter `/notes-api-zaman/db-password` | the only stored secret |
+| 9 | CloudWatch log group `/ecs/notes-api-zaman` | |
+| 10 | Security groups `notes-api-alb-sg`, `notes-api-zaman-sg` | only after the ALB and tasks holding them were gone |
+| 11 | IAM: user `exam-deployer-zaman` and its access key, roles `github-actions-deployer-zaman` and `notes-api-task-role-zaman`, policies `exam-deployer-policy-zaman` and `notes-api-task-policy-zaman`, and the GitHub OIDC identity provider | last, since deleting the deploy user removes the ability to run anything else |
+
+Two things were deliberately left:
+
+- **Task definition revisions `notes-api-zaman:1-6`.** ECS deregisters revisions rather
+  than deleting them and they cost nothing. The JSON is committed in the repo anyway.
+- **`ecsTaskExecutionRole`.** A standard AWS-managed-policy role, not something this
+  exam created, and it carries no cost.
+
+### Nothing left
+
+```
+=== ECS clusters ===        []
+=== load balancers ===      []
+=== S3 buckets ===          (none)
+=== EC2 instances still alive ===
+ i-097349a94483f20ac | 2026-09-19T01:31:58+00:00 | ashik-admin-pw
+```
+
+### The one instance still running is not mine
+
+`i-097349a94483f20ac` remains, and it is worth being precise about rather than quietly
+ignoring. This AWS account is shared — the CLI on the exam VPS had a pre-existing default
+profile belonging to `fc-exam-deployer`, a user I did not create and whose permissions
+differ from mine. Three things say the instance is not part of this submission:
+
+1. **Its Name tag is `ashik-admin-pw`.** Every resource in this submission is suffixed or
+   prefixed `zaman`, per the convention in the root README.
+2. **It launched at 2026-09-19 01:31 UTC.** My first AWS action in this account was around
+   17:00 UTC the same day — the timestamp on the Task 47 evidence. It was already running
+   sixteen hours before I had an IAM user.
+3. **It is a `c7i.2xlarge`.** This scenario used Fargate exclusively and created no EC2
+   instances at all. Had it been the ASG left behind by the `sturdy-bat` cluster, its name
+   would have been `ECSAutoScalingGroup-...`.
+
+I did not terminate it. Deleting another user's running instance in a shared account is
+not recoverable, and being asked to clean up my own resources is not authorisation to
+remove someone else's. It will appear in the billing screenshot — a `c7i.2xlarge` is
+roughly $0.36 an hour — which is why the instance listing and the bill are submitted
+together.
+
+### The pipeline after cleanup
+
+`deploy.yml` pushed to ECR and updated the ECS service, both of which no longer exist. Its
+trigger was reduced from `push` to `workflow_dispatch` rather than deleting the file: left
+on `push`, every later commit would queue a run that fails for the entirely expected
+reason that its destination is gone, and a repository whose most recent workflow run is
+red says something untrue about the work. The successful run that deployed
+`notes-api-zaman:3` remains as the Task 53 evidence.
+
+The ALB URL recorded in the root README is dead for the same reason and is annotated there
+rather than removed, so the link still shows what was running and when.
+
+### Credentials on the shared VPS
+
+The exam VPS is shared with other candidates, so leaving AWS credentials in
+`~/.aws/credentials` after the account they belong to has been dismantled is worse than
+untidy. My profile's keys were cleared, and the access key itself deleted in IAM, so even
+a copy of that file elsewhere is now worthless.
+
+The unrelated `fc-exam-deployer` profile in the same file was left alone — it is not mine
+to delete, the same reasoning as the EC2 instance.
+
+### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c5-task63-nothing-left.png` | token + date, empty ECS clusters, load balancers and S3, and the one surviving instance with its name and launch time |
+| `c5-task63-ecr-empty.png` | the ECR console with no repositories (`fc-exam-deployer` has no `ecr:DescribeRepositories`, so this one is from the console) |
+| `c5-task63-billing.png` | the account's current spend |
+
+One note on how that first listing was produced: it ran under the shared account's default
+profile, not `exam-deployer-zaman`. My own deploy user cannot list clusters, buckets,
+load balancers or instances — it was scoped in C1 to push one repository and update one
+service, and nothing else. Being unable to verify my own cleanup with it is the C1 policy
+working as intended.
