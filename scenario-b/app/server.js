@@ -17,7 +17,7 @@ const INSTANCE = process.env.HOSTNAME || os.hostname();
 // source rather than an environment variable on purpose: the point of that task
 // is to prove the *image* rolled over, and a version that can be changed with
 // --env-add would prove nothing about which build is running.
-const APP_VERSION = '2';
+const APP_VERSION = '3';
 app.use((req, res, next) => {
   res.set('X-Served-By', INSTANCE);
   next();
@@ -66,9 +66,20 @@ app.use(resolveTenant);
 // Health endpoints
 // ---------------------------------------------------------------------------
 
+// DELIBERATELY BROKEN for B4 Task 38. Set back to false to restore.
+//
+// Breaking the health endpoint rather than crashing on startup is the more
+// interesting failure: the process stays up and the container keeps accepting
+// connections, so nothing looks wrong from the outside. Only the HEALTHCHECK
+// notices, which is exactly what the rollback is supposed to depend on.
+const BREAK_HEALTHCHECK = true;
+
 // Liveness: is the process up. Nothing else. If this touched the database, a
 // database blip would make ECS kill and restart perfectly healthy containers.
 app.get('/healthz', (req, res) => {
+  if (BREAK_HEALTHCHECK) {
+    return res.status(500).json({ status: 'broken on purpose', version: APP_VERSION, instance: INSTANCE });
+  }
   res.json({ status: 'ok', version: APP_VERSION, instance: INSTANCE, uptime: process.uptime() });
 });
 
