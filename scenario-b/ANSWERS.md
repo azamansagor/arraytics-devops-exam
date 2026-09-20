@@ -383,6 +383,256 @@ and none of them is present.
 
 ---
 
+## B4 — Docker Swarm
+
+Stack file: [`docker/stack.yml`](docker/stack.yml). The image comes from GHCR, published
+by `release.yml`, pinned to a commit SHA rather than `latest` — a service following
+`latest` cannot say which build it is running, and `docker service rollback` has nothing
+specific to return to.
+
+### Two things about this host that shaped everything below
+
+**The swarm is shared.** `docker service ls` showed six other candidates' stacks already
+running on it. One of them had taken the service name `notes_app`.
+
+The brief says `docker stack deploy ... notes`. Running that would have replaced a
+stranger's running service with my image: **Swarm treats a name collision as an update,
+not a conflict** — no prompt, no error, the existing service simply starts running
+someone else's code. The stack is therefore `zaman_notes`, which prefixes every service,
+and the published port is 3111 because 3120, 3140, 3200, 5151, 8400 and 30104 were taken
+by others and 3110 by this submission's own `myapp_zaman.service` from A1. Checking
+before deploying cost thirty seconds.
+
+**The ingress routing mesh does not deliver on this host.** `ss` showed dockerd listening
+on 3111 with connections stacking up in the accept queue, while all five replicas were
+`(healthy)` and answered `/healthz` from inside their own containers. The application was
+never the problem.
+
+Swarm has **two** load balancers and only one had failed:
+
+| | Reaches the service by | Used for |
+| --- | --- | --- |
+| **Ingress mesh** | a published port on any node | outside traffic — broken here |
+| **VIP** | the service name on its overlay network | inside traffic — works |
+
+Everything below is measured through the VIP, from a container attached to
+`zaman_notes_notes-net`. That required `attachable: true` on the network, since
+stack-created overlays refuse `docker run --network` by default — and it is needed
+anyway, because the traffic loop for Task 37 has to outlive the containers being
+replaced. Running it inside an app task would mean the loop is killed by the very update
+it is measuring.
+
+### Task 35 — Deploy the stack
+
+**One node.** `docker node ls` shows a single manager, `vmi3536696`, as Leader. The brief
+says multi-node scores better; there is one VPS and it is shared, so this is single-node
+and said plainly rather than implied.
+
+```
+NAME              MODE         REPLICAS   IMAGE                                        PORTS
+zaman_notes_app   replicated   3/3        ghcr.io/azamansagor/notes-api-zaman:v1.1.5   *:3111->3000/tcp
+zaman_notes_db    replicated   1/1        postgres:16-alpine
+```
+
+The database is constrained to one replica on the manager. Scaling it would start a
+second Postgres against the same volume, which corrupts it — the kind of thing a
+`replicas:` line makes far too easy.
+
+No `depends_on`, because Swarm has none. That is not worked around: the app opens its
+connection pool lazily and `/healthz` never touches the database, so a replica is
+legitimately healthy before Postgres is ready and starts serving the moment it can.
+
+### Task 36 — Scale to 5 and prove it
+
+```
+docker service scale zaman_notes_app=5
+
+--- 50 requests through the service VIP ---
+     10 X-Served-By: 1c09540360de
+     10 X-Served-By: 26a94ce8880c
+     10 X-Served-By: 3063a32bad1b
+     10 X-Served-By: 4be6c89fef83
+     10 X-Served-By: 8cf7bd6f406a
+```
+
+Five distinct container ids, ten requests each. Not approximately — exactly, which is
+round-robin doing what it says.
+
+`Connection: close` on every request is load-bearing. Without it curl reuses one TCP
+connection, the VIP keeps sending it to the same replica, and the output is fifty hits on
+one container — which reads as "scaling did not work" when in fact nothing was ever
+balanced because nothing new was ever connected.
+
+### Task 37 — Rolling update with zero downtime
+
+Two images differing in one constant, `APP_VERSION`, reported by `/healthz`. A constant in
+the source rather than an environment variable deliberately: the task is to prove the
+*image* rolled over, and a version settable with `--env-add` would prove nothing about
+which build is running.
+
+Traffic loop running throughout at five requests a second, from a container on the
+overlay network.
+
+```
+docker service update --image ...:cfd864cd zaman_notes_app
+  1/5: running ... 5/5: running
+  verify: Service zaman_notes_app converged
+
+started  18:17:55
+finished 18:22:42          → 4 minutes 47 seconds
+
+total requests: 583
+--- status code distribution ---
+    583 200
+--- any non-200, with timestamps ---
+(none)
+
+{"status":"ok","version":"2","instance":"7568af2230c7", ...}
+```
+
+**583 requests, 583 successes, zero failures**, and the version flipped from 1 to 2.
+
+Three things had to be true at once, and any one of them missing would have produced
+failures:
+
+1. **`order: start-first`.** The default, `stop-first`, removes a replica before its
+   replacement exists, so at `parallelism: 1` there is always a window serving one fewer.
+2. **A healthcheck in the image.** Without it Swarm considers a container ready the
+   instant it starts, and routes traffic to a Node process that has not finished booting.
+3. **The SIGTERM handler in `server.js`.** Swarm stops the old replica with SIGTERM; the
+   app closes its listener and lets in-flight requests finish. Without it the process is
+   killed mid-response and those connections become failures.
+
+`parallelism: 1` with `delay: 10s` is why it took nearly five minutes. That is the trade:
+slower rollout, smaller blast radius. At `parallelism: 5` it would have finished in under
+a minute and every replica would have changed at once — which is fine until the new
+version is broken, as it is in the next task.
+
+### Task 38 — Break v3 and let Swarm roll it back
+
+v3 returns **500 from `/healthz`** rather than crashing at startup. That is the more
+interesting failure and it was chosen on purpose: the process stays up, the port stays
+open, connections are accepted, and nothing looks wrong from outside the container. Only
+the HEALTHCHECK notices — which is precisely the mechanism the rollback depends on.
+
+```
+docker service update --image ...:d7defcd zaman_notes_app
+
+{
+    "State": "rollback_completed",
+    "StartedAt":   "2026-09-20T16:31:45.408Z",
+    "CompletedAt": "2026-09-20T16:33:28.898Z",
+    "Message": "rollback completed"
+}
+
+zaman_notes_app.1   ...notes-api-zaman:d7defcd...   Complete 4 minutes ago
+ \_ zaman_notes_app.1 ...notes-api-zaman:cfd864cd... Running 17 minutes ago
+zaman_notes_app.2   ...notes-api-zaman:cfd864cd...  Running 15 minutes ago
+...
+REPLICAS 5/5   ghcr.io/azamansagor/notes-api-zaman:cfd864cd...
+healthz -> 200
+```
+
+**Deploy command to full rollback: 1 minute 43 seconds.**
+
+Only replica `.1` ever ran v3. `parallelism: 1` meant 20% of capacity was at risk for
+under two minutes and the other four never changed — which is what that setting is for.
+
+#### The state says Complete, not Failed
+
+The brief expects `Failed` or `Rejected`. This showed `Complete`, and the reason is the
+submission's own code.
+
+Swarm sent SIGTERM to stop the unhealthy container. The graceful shutdown handler added
+for Task 37 caught it, closed the listener and exited **0**, so Swarm recorded the task as
+having completed normally. The rollback still fired, because the update monitor judges
+whether a task became *healthy* within `monitor: 30s`, not what exit code it eventually
+produced.
+
+The same handler helps in one task and hides the symptom in the next. Worth knowing
+before reading an exit code as a verdict.
+
+#### What if the image had no healthcheck? Would Swarm have noticed?
+
+**No.** Nothing else about v3 was wrong. The process ran, the port was open, connections
+were accepted, and it exited cleanly when asked. With no `HEALTHCHECK`, Swarm's only test
+is whether the container is running — which it was.
+
+The rollout would have proceeded through all five replicas, reported `converged`, and left
+the entire service returning 500 from its health endpoint while Swarm insisted everything
+was fine. `failure_action: rollback` would never have triggered, because from Swarm's view
+there was no failure.
+
+That is why the image carries a healthcheck and why breaking the endpoint rather than the
+process was the right way to test this: a crash would have been caught either way, and the
+question would have gone unanswered.
+
+### Task 39 — Limits versus reservations
+
+```
+Mem:   total 7   used 3   free 1   available 3   (GB)
+
+docker service update --reserve-memory 8G zaman_notes_app
+
+zaman_notes_app.2   Pending 7 minutes ago   "no suitable node (insufficient resources on 1 node)"
+ \_ zaman_notes_app.2   Running 37 minutes ago
+```
+
+| | **Limit** | **Reservation** |
+| --- | --- | --- |
+| Enforced by | the kernel, through cgroups | the Swarm scheduler |
+| Enforced when | while the container runs | when the task is placed |
+| Exceeding it | OOM kill — **exit 137** | cannot happen; the task is never placed |
+| Symptom | container dies without warning | task sits `Pending` forever |
+
+A **limit is a ceiling**; a **reservation is a promise**. The reservation does not hold
+memory aside — nothing is set apart for the task. It tells the scheduler "only place this
+where at least this much is unspoken for", and the running container may then use far
+less, or push against the limit instead.
+
+Both failure modes follow from that. Reserve too much and nodes sit half empty while
+tasks queue for capacity that exists. Reserve too little and the scheduler packs more
+work onto a node than it can carry, and the containers meet the *limit* instead — dying
+at exit 137 under load, which looks like an application bug.
+
+Note the old replica kept running throughout. `start-first` will not remove anything
+until a replacement is ready, so an impossible reservation stalls the update without
+taking the service down.
+
+### Task 40 — Scale down during live traffic
+
+```
+zaman_notes_app scaled to 5 ... converged   19:00:35
+zaman_notes_app scaled to 2 ... converged   19:03:10
+
+total requests: 148
+--- status codes ---
+    148 200
+--- any non-200 ---
+(none)
+```
+
+**148 requests, zero failures**, scaling from 5 replicas to 2 under continuous traffic.
+
+The same graceful shutdown that made Task 37 clean is what makes this clean: Swarm
+SIGTERMs three replicas, each stops accepting new connections and finishes what it is
+already serving, and the VIP stops routing to them. Without that handler these would have
+been killed mid-response and the loop would show the difference.
+
+### Evidence
+
+| File | Shows |
+| --- | --- |
+| `b4-task35-stack-deployed.png` | `docker node ls` (single manager), the stack's services, and the five healthy containers |
+| `b4-task36-five-replicas.png` | five container ids with exactly ten requests each through the VIP |
+| `b4-task37-rolling-update.png` | the update converging, and each task's image history from `v1.1.5` through `a73b253` to `cfd864cd` |
+| `b4-task37-zero-downtime-count.png` | 583 requests, 583 × 200, and `"version":"2"` serving afterwards |
+| `b4-task38-rollback-completed.png` | `rollback_completed` with both timestamps, `.1` on the broken image, and 5/5 back on v2 answering 200 |
+| `b4-task39-reservation-unschedulable.png` | 8 GB reserved on a node with 3 GB available, task `Pending` with `no suitable node` |
+| `b4-task40-scale-down.png` | 5 → 2 under load, 148 requests, no failures |
+
+---
+
 ## B5 — CI/CD with GitHub Actions
 
 Two workflows, both with the exam token in a comment at the top:
