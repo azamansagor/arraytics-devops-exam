@@ -43,10 +43,13 @@
       "Resource": "*"
     },
     {
-      "Sid": "PassOnlyTheTaskExecutionRoleAndOnlyToEcsTasks",
+      "Sid": "PassOnlyTheseTwoEcsRolesAndOnlyToEcsTasks",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::750069566598:role/ecsTaskExecutionRole",
+      "Resource": [
+        "arn:aws:iam::750069566598:role/ecsTaskExecutionRole",
+        "arn:aws:iam::750069566598:role/notes-api-task-role-zaman"
+      ],
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": "ecs-tasks.amazonaws.com"

@@ -9,6 +9,7 @@
     "operatingSystemFamily": "LINUX"
   },
   "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/notes-api-task-role-zaman",
   "containerDefinitions": [
     {
       "name": "postgres",

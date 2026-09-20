@@ -1,6 +1,7 @@
 const os = require('os');
 const express = require('express');
 const { pool, query } = require('./db');
+const s3 = require('./s3');
 
 const app = express();
 app.use(express.json());
@@ -217,6 +218,66 @@ app.get('/api/stats', async (req, res, next) => {
       [req.tenantId]
     );
     res.json(rows[0] || { slug: req.tenantSlug, notes: 0, tags: 0 });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Attachments (S3)
+// ---------------------------------------------------------------------------
+//
+// The API never proxies file bytes. It signs a URL and the client talks to S3
+// directly, so a 2 GB upload does not occupy a node process or a database
+// connection for its duration. The bucket stays private: nothing here grants
+// standing access, only a URL that expires.
+
+// POST /api/attachments/upload-url  { filename, contentType, visibility? }
+app.post('/api/attachments/upload-url', async (req, res, next) => {
+  try {
+    const { filename, contentType, visibility } = req.body || {};
+    if (!filename) return res.status(400).json({ error: 'filename is required' });
+
+    // The client proposes a filename; the server decides the key. A client that
+    // chose its own key could write into another tenant's prefix, and every
+    // isolation check downstream reads that prefix.
+    const key = s3.buildKey(req.tenantSlug, filename, visibility);
+    const uploadUrl = await s3.presignUpload(key, contentType);
+
+    res.status(201).json({
+      key,
+      uploadUrl,
+      expiresIn: s3.UPLOAD_EXPIRY_SECONDS,
+      method: 'PUT',
+      visibility: visibility === 'public' ? 'public' : 'private',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/attachments/<key>/download-url
+//
+// The key contains slashes, so the wildcard captures everything between the
+// prefix and the suffix. ?key= is accepted too, for callers that would rather
+// not escape a path.
+app.get(['/api/attachments/*/download-url', '/api/attachments/download-url'], async (req, res, next) => {
+  try {
+    const key = req.params[0] || req.query.key;
+    if (!key) return res.status(400).json({ error: 'key is required' });
+
+    // Task 58. The check is here, before anything is signed, because a presigned
+    // URL carries the signer's authority: once issued, S3 will honour it without
+    // any further reference to who asked. There is no second chance to say no.
+    if (!s3.ownsKey(req.tenantSlug, key)) {
+      return res.status(403).json({
+        error: 'forbidden',
+        detail: `tenant '${req.tenantSlug}' may not access '${key}'`,
+      });
+    }
+
+    const downloadUrl = await s3.presignDownload(key);
+    res.json({ key, downloadUrl, expiresIn: s3.DOWNLOAD_EXPIRY_SECONDS });
   } catch (err) {
     next(err);
   }
