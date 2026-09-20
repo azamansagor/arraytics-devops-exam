@@ -714,3 +714,103 @@ for acme, so the replacement tasks completed their seeding before taking traffic
 | `c2-task53-trust-policy.png` | the trust policy with its repository condition |
 | `c2-task53-pipeline-success.png` | the green run, the assumed-role ARN, the exam token, and `notes-api-zaman:3` |
 | `c2-task53-new-task-definition-revision.png` | revision 3 in service, and one image carrying the SHA, `v1.0.3` and `latest` |
+
+### Task 54 — Something is broken, debug it
+
+I broke the target group's health check path: `/readyz` changed to `/healthz-broken`, a
+route the application does not serve. Within a few minutes both targets went unhealthy,
+the ALB returned 503, and ECS began replacing tasks that were working perfectly.
+
+The port option the brief also offers was not available: a target group's port is fixed
+at creation, so changing it means building a second target group rather than editing one.
+
+#### The order I checked things in
+
+Outside in, from what a user sees towards the process, stopping at the first layer where
+two things disagree.
+
+**1. What does the caller get?**
+
+```
+curl -s -o /dev/null -w "%{http_code}" http://$ALB/healthz   ->  503
+```
+
+503, not 504, and the difference decides where to look next. **503 means the ALB had no
+healthy target to send the request to. 504 means it had one and the target did not answer
+in time.** The first is a registration or health problem; the second is a slow
+application. Confusing them sends you to debug the wrong system.
+
+**2. Does the load balancer have anything to send to?**
+
+Target group → Targets: both targets unhealthy. The Health status details column does not
+make you guess:
+
+> `Health checks failed with these codes: [400]`
+
+**3. Read that code before touching anything.**
+
+A status code came back, so something is listening and answering. A dead process gives
+connection refused or a timeout, not an HTTP response. So the application is alive and
+this is not a crash.
+
+**4. Is ECS actually running the tasks?**
+
+`describe-services` showed the tasks running, and the service events showed ECS beginning
+to replace them as unhealthy. Tasks running, ALB unsatisfied — the disagreement is
+between the checker and the checked, not inside either one.
+
+**5. Ask the container directly, bypassing the ALB.**
+
+```
+direct /readyz         -> 200
+direct /healthz        -> 200
+direct /healthz-broken -> 400
+/api/stats             -> {"slug":"acme","notes":"30000", ...}
+```
+
+The application is completely healthy. It serves its endpoints and its data. Only the
+path the ALB was asking for fails.
+
+**6. Compare the check's configuration with what the app serves.**
+
+Health check path `/healthz-broken`; the app serves `/healthz` and `/readyz`. Found. Path
+restored, and the targets returned to healthy within a minute.
+
+#### The failure code was 400, not the 404 I expected
+
+This is the part I would have got wrong by reasoning alone.
+
+`resolveTenant` runs as middleware ahead of the routes and exempts exactly three paths —
+`/healthz`, `/readyz`, `/metrics`. Anything else without an `X-Tenant` header is rejected
+there, before the router is ever consulted. An ALB health check sends no such header, so
+`/healthz-broken` never reached the point where it could have been a 404; it was a 400
+from tenant resolution.
+
+The practical consequence is worth keeping: **pointing the health check at
+`/api/stats` — a route that works perfectly — would also fail, with 400, for a reason
+that has nothing to do with that route.** Any endpoint behind the tenant middleware is
+unusable as a health check, whatever its own behaviour. That is a property of middleware
+ordering, and it is invisible if you only read the route handlers.
+
+#### One mistake on the way
+
+My first attempt to curl the container used the task's **private** IP, `172.31.79.158`,
+which is a VPC address and unreachable from the exam VPS. curl returned `000`.
+
+`000` is not an HTTP status — it means curl never got a response to report. That
+distinction is the same one as step 3, one layer lower: **no connection at all is a
+different problem from a connection that answers with an error.** `000` says routing,
+security group or wrong address. `400` says the application received the request and
+turned it down. Reading `000` as "the app is broken" would have sent me to the logs of an
+application with nothing wrong with it.
+
+Fixed by using the task's public IP, which the security group already allows from the
+VPS on port 3000.
+
+#### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c2-task54-before.png` | the ALB serving 200 before anything was broken |
+| `c2-task54-broken-target-group.png` | targets unhealthy with `Health checks failed with these codes: [400]` |
+| `c2-task54-after-fix.png` | after restoring `/readyz`: 2 healthy, 0 unhealthy, and the replaced task draining |
