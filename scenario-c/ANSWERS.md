@@ -814,3 +814,173 @@ VPS on port 3000.
 | `c2-task54-before.png` | the ALB serving 200 before anything was broken |
 | `c2-task54-broken-target-group.png` | targets unhealthy with `Health checks failed with these codes: [400]` |
 | `c2-task54-after-fix.png` | after restoring `/readyz`: 2 healthy, 0 unhealthy, and the replaced task draining |
+
+---
+
+## C3 — S3 and file uploads
+
+Bucket `notes-api-zaman-uploads` in `us-east-1`. The API never proxies file bytes: it
+signs a URL and the client talks to S3 directly, so a large upload does not hold a node
+process or a database connection open for its duration.
+
+Credentials come from a **task role**, `notes-api-task-role-zaman` — a different
+principal from the execution role ECS uses to pull images and read the database password
+from SSM. The application can reach S3 and nothing else; it cannot read the secret that
+starts it. The role is scoped to `s3:GetObject` and `s3:PutObject` on this bucket's
+objects, with no `s3:ListBucket`, so a compromised application cannot enumerate keys it
+was not already told about.
+
+Adding that role surfaced the C1 policy doing its job: `iam:PassRole` was scoped to
+`ecsTaskExecutionRole` alone and refused the new role by name. It was widened by naming
+the second role, not by a wildcard. `iam:PassRole` is the permission that turns "can
+write a task definition" into "can assume any role in the account", which is why it is
+worth the extra edit.
+
+### Task 55 — Private bucket and presigned upload
+
+`POST /api/attachments/upload-url` returns a presigned PUT. The client proposes a
+filename; the **server** decides the key, because a client that chose its own key could
+write into another tenant's prefix, and every check downstream reads that prefix. The
+filename is stripped of anything that could climb out of it.
+
+```
+upload            : 200
+same URL unsigned : 403
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message>...
+```
+
+One thing worth knowing before it costs an hour: the upload must send the same
+`Content-Type` the URL was signed with. SigV4 covers named headers, not just the path,
+so a mismatched or missing content type returns `SignatureDoesNotMatch` even though the
+URL itself is perfectly valid.
+
+### Task 56 — Presigned download and expiry
+
+`GET /api/attachments/<key>/download-url` returns a presigned GET with `expiresIn: 60`.
+
+| When | Result |
+| --- | --- |
+| immediately | `200`, file contents returned |
+| after 65 s | `403` |
+| no signature at all | `403` |
+
+S3 distinguishes the two refusals in its own words, and the difference is diagnostic:
+
+```xml
+<Error><Code>AccessDenied</Code><Message>Request has expired</Message>
+<X-Amz-Expires>60</X-Amz-Expires><Expires>2026-09-20T00:34:36Z</Expires>
+<ServerTime>2026-09-20T00:57:37Z</ServerTime></Error>
+```
+
+*Request has expired* means a valid signature arrived too late. Plain *Access Denied*
+means none arrived at all. The first is a clock problem, the second an authorisation one.
+
+#### If a user posts their presigned URL in a public Telegram group
+
+**What strangers can do:** exactly one thing — read that one object. The signature is
+bound to that key and that method. They cannot list the bucket, cannot write, cannot
+reach any other object, and cannot touch another tenant's data. But for that object there
+is no further check: S3 does not know or care who presents the URL, and no login is
+involved. The URL *is* the authorisation.
+
+**For how long:** 60 seconds from issue. Two limits actually apply, and the shorter wins.
+The URL carries `X-Amz-Security-Token`, so it was signed with the task role's temporary
+credentials; if those expire before the 60 seconds are up, the URL dies with them.
+
+**Two ways to reduce the risk**
+
+1. **Shrink the window, and issue at the moment of use.** Sign only when the user
+   actually clicks download, with an expiry of a few seconds rather than sixty. Costs
+   nothing and removes the common failure mode — a long-lived URL sitting in a chat log,
+   an email, or a browser history where it can be copied later.
+
+2. **Make the link revocable by putting the API in the path.** Hand out a link to *our*
+   endpoint carrying an opaque one-time token we recorded, not a link to S3. On request we
+   check authentication, mark the token used, and redirect to a freshly signed URL valid
+   for seconds. Because the token lives in our database, we can expire it, limit it to one
+   use, or revoke it after a leak.
+
+**Which I would implement, and why:** (1) immediately, because it is a one-line change
+and cuts the exposure window by an order of magnitude. But (2) is the real answer for
+anything sensitive, and the reason is precise: **shortening the expiry reduces the chance
+of a leak mattering; it can never undo one.** A presigned URL, once issued, cannot be
+withdrawn — there is no revocation list, and rotating the signing credentials would
+invalidate every URL in flight, not just the leaked one. Only a token we own can be taken
+back. The cost is that every download now touches our service, which is exactly the load
+presigning was meant to avoid, so it is a trade rather than a free upgrade.
+
+### Task 57 — Two access patterns in one bucket
+
+| Attempt | Result |
+| --- | --- |
+| `public/acme/...` with a plain URL | **200**, contents returned |
+| `tenants/acme/private/...` with a plain URL | **403** `AccessDenied` |
+| the same private object, presigned | **200**, contents returned |
+
+#### The Block Public Access conflict, and how it is resolved
+
+Task 55 says to leave Block Public Access on; Task 57 needs `public/*` readable by
+anyone. These cannot both be fully true, because **BPA sits above bucket policies and
+voids any public grant they make** — with all four settings on, the policy below would be
+accepted and then ignored.
+
+Two of the four were turned off, and only those two:
+
+| Setting | State | Why |
+| --- | --- | --- |
+| through **new ACLs** | **on** | |
+| through **any ACLs** | **on** | |
+| through **new public bucket policies** | off | required for the policy to take effect |
+| through **any public bucket policies** | off | required for it to keep taking effect |
+
+Keeping both ACL blocks on is the point. Public access can now be granted **only** by the
+bucket policy — one document, in one place, versioned and reviewable. Had the ACL blocks
+come off too, any individual object could quietly become public through its own ACL, and
+nothing in the policy would say so.
+
+The policy itself grants one action on one prefix:
+
+```json
+{ "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::notes-api-zaman-uploads/public/*" }
+```
+
+No write, and `tenants/*` is not mentioned at all. The console now flags the bucket as
+publicly accessible, which is accurate: one prefix genuinely is.
+
+What separates the two patterns is nothing but the prefix a key starts with — and the
+prefix is chosen by the server, never by the client.
+
+### Task 58 — Tenant isolation
+
+| Request | Result |
+| --- | --- |
+| globex asks for its own key | **200** |
+| acme asks for globex's key | **403** `tenant 'acme' may not access 'tenants/globex/private/...'` |
+| acme asks for `tenants/acme-corp/private/x.txt` | **403** |
+
+The same key, two tenants, opposite answers. The object exists and acme knows its exact
+name; knowing the key is not access.
+
+The check runs in the application, **before anything is signed**, and it has to. A
+presigned URL carries the signer's authority and S3 honours it without consulting anyone
+— there is no point after signing at which the request can still be refused.
+
+The third row is the detail that would have been a vulnerability. The comparison is
+against `tenants/acme/` **with the trailing slash**. Comparing against `tenants/acme`
+alone would also match `tenants/acme-corp/private/x.txt` — a different tenant whose name
+merely begins the same way. Prefix checks fail quietly like this, and the failure looks
+like nothing at all until the day a customer signs up with a name that is an extension of
+another's.
+
+### Evidence
+
+| File | Shows |
+| --- | --- |
+| `c3-task55-presigned-url.png` | the signed PUT URL with its SigV4 query parameters |
+| `c3-task55-upload-success.png` | upload 200, the same URL unsigned 403 with AccessDenied XML |
+| `c3-task55-object-in-console.png` | the object in the bucket under `tenants/acme/private/` |
+| `c3-task56-expiry.png` | `expiresIn: 60`, 200 immediately, 403 `Request has expired` after 65s |
+| `c3-task56-no-signature.png` | the plain object URL returning AccessDenied |
+| `c3-task57-three-cases.png` | public 200, private 403, same private object presigned 200 |
+| `c3-task58-tenant-isolation.png` | globex 200, acme 403 on the same key, and the near-miss prefix also 403 |
