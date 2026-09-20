@@ -12,6 +12,12 @@ const PORT = Number(process.env.PORT || 3000);
 // proof that requests really are spread across them, so every response carries the
 // hostname - inside a container that is the container id.
 const INSTANCE = process.env.HOSTNAME || os.hostname();
+
+// Bumped by hand for the rolling-update test in B4 Task 37. A constant in the
+// source rather than an environment variable on purpose: the point of that task
+// is to prove the *image* rolled over, and a version that can be changed with
+// --env-add would prove nothing about which build is running.
+const APP_VERSION = '1';
 app.use((req, res, next) => {
   res.set('X-Served-By', INSTANCE);
   next();
@@ -63,7 +69,7 @@ app.use(resolveTenant);
 // Liveness: is the process up. Nothing else. If this touched the database, a
 // database blip would make ECS kill and restart perfectly healthy containers.
 app.get('/healthz', (req, res) => {
-  res.json({ status: 'ok', instance: INSTANCE, uptime: process.uptime() });
+  res.json({ status: 'ok', version: APP_VERSION, instance: INSTANCE, uptime: process.uptime() });
 });
 
 // Readiness: can this instance actually serve traffic, which means the database
@@ -308,6 +314,6 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
     });
   });
 }
-// touched 2026-09-20T14:34:22Z to measure warm cache
-// warm cache check 2026-09-20T14:54:55Z
-// warm cache check 2026-09-20T15:00:38Z
+
+
+
