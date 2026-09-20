@@ -3,7 +3,15 @@
 # Swarm stack for the Notes API.
 #
 #   export PG_PASS='<chosen at deploy time, never committed>'
-#   docker stack deploy -c scenario-b/docker/stack.yml notes
+#   docker stack deploy -c scenario-b/docker/stack.yml zaman_notes
+#
+# The stack is named zaman_notes, not notes as the brief writes it. This VPS is
+# shared and its Swarm already carries six other candidates' stacks, one of which
+# had claimed the service name notes_app. Deploying as `notes` would have
+# replaced a running service belonging to someone else, silently and with no
+# confirmation - Swarm treats an existing service of the same name as something
+# to update. Every service below is therefore prefixed zaman_ by the stack name,
+# and the published port avoids the ones already taken.
 #
 # The image comes from GHCR, published by .github/workflows/release.yml, so what
 # runs here is what CI built rather than something compiled by hand on the host.
@@ -52,10 +60,12 @@ services:
       DB_NAME: notesdb
       DB_PASSWORD: ${PG_PASS}
     ports:
-      # 3110 on the host, per the shared-VPS convention in the root README.
-      # Swarm's routing mesh publishes this on every node and load balances
-      # across replicas wherever they run.
-      - "3110:3000"
+      # 3111, not the 3110 in the root README's convention table: 3110 is held by
+      # this submission's own myapp_zaman.service from A1, and the other ports
+      # nearby (3120, 3140, 3200, 5151, 8400, 30104) belong to other candidates'
+      # stacks on the same host. Swarm's routing mesh publishes this on every
+      # node and load balances across replicas wherever they run.
+      - "3111:3000"
     networks:
       - notes-net
     deploy:
