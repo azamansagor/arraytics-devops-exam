@@ -88,11 +88,11 @@ jobs:
           # only the final stage and drop the npm ci layer, which is the one layer
           # actually worth caching.
           #
-          # image-manifest=true and oci-mediatypes=true are not optional on GHCR.
-          # Without them BuildKit writes the cache as an OCI index using media
-          # types GHCR rejects; the export fails, the build still goes green, and
-          # the only sign is a warning nobody reads. That is the second time in
-          # this task that caching failed silently, which is the whole lesson.
+          # image-manifest=true and oci-mediatypes=true are belt and braces. GHCR
+          # accepted BuildKit's default cache manifest here without them - the log
+          # reports "inferred cache manifest type: application/vnd.oci.image
+          # .manifest.v1+json" - but pinning the format keeps this working if the
+          # default changes, and costs nothing.
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
 
