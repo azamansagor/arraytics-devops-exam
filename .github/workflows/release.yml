@@ -1,13 +1,15 @@
 # Exam token: root-vmi3536696-1788597274-30dab396
 #
-# Main-branch pipeline: build the image once and publish it to GitHub Container
-# Registry, tagged with both the git SHA and a version. This is the registry the
-# Swarm stack in B4 pulls from, so what CI publishes is literally what runs.
+# Main-branch pipeline: build the image once, publish it to GitHub Container
+# Registry, then - after a human approves - roll the VPS Swarm service onto it.
+# This is the registry the stack in B4 pulls from, so what CI publishes is
+# literally what runs.
 #
-# There are no static credentials. GITHUB_TOKEN is minted for this run, scoped by
-# the permissions block below, and expires when the job ends - it is not a secret
-# anyone stored, and it cannot be replayed tomorrow. The AWS pipeline in
-# deploy.yml made the same guarantee a different way, through OIDC.
+# There are no static credentials for the registry. GITHUB_TOKEN is minted for
+# this run, scoped by the permissions block below, and expires when the job ends.
+# The AWS pipeline in deploy.yml made the same guarantee a different way, through
+# OIDC. The VPS deploy key is the one long-lived secret here, and it is fenced -
+# see the deploy-vps job.
 
 name: release
 
@@ -87,12 +89,6 @@ jobs:
           # mode=max because this is a multi-stage build: mode=min would export
           # only the final stage and drop the npm ci layer, which is the one layer
           # actually worth caching.
-          #
-          # image-manifest=true and oci-mediatypes=true are belt and braces. GHCR
-          # accepted BuildKit's default cache manifest here without them - the log
-          # reports "inferred cache manifest type: application/vnd.oci.image
-          # .manifest.v1+json" - but pinning the format keeps this working if the
-          # default changes, and costs nothing.
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
 
@@ -103,3 +99,58 @@ jobs:
           echo "  ${{ env.IMAGE }}:${{ github.sha }}"
           echo "  ${{ env.IMAGE }}:v1.1.${{ github.run_number }}"
           echo "  ${{ env.IMAGE }}:latest"
+
+  # ---------------------------------------------------------------------------
+  # Task 44 - deploy to the VPS Swarm, behind an approval gate.
+  #
+  # `environment:` is what creates the gate. The environment has a required
+  # reviewer, so this job does not start when build-and-push finishes - it waits
+  # at "Review pending deployments" until a human approves it. The build has
+  # already happened, so nothing is lost by waiting, and what gets approved is a
+  # specific image that exists rather than a promise to build one.
+  #
+  # The deploy key is the one long-lived secret in this repository, so it is
+  # fenced on the far side: authorized_keys pins it to a forced command
+  # (scenario-b/deploy/zaman-deploy.sh) with no pty and no forwarding. The key
+  # cannot open a shell, read a file, or touch any service but zaman_notes_app -
+  # which matters on a VPS shared with six other candidates.
+  # ---------------------------------------------------------------------------
+  deploy-vps:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    environment:
+      name: production-vps
+      url: http://169.58.246.108:3111/healthz
+
+    steps:
+      - name: Show exam token and time
+        run: echo "root-vmi3536696-1788597274-30dab396 | $(date)"
+
+      - name: Deploy to the Swarm service over SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SHA: ${{ github.sha }}
+        run: |
+          install -d -m 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # Trust on first use. Pinning the host key as a secret would be
+          # stricter, since keyscan believes whatever answers on port 22 - but
+          # the forced command on the far side means a wrong host would receive
+          # a commit sha and nothing else, so the exposure is one public string.
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # The sha is the entire payload. This side cannot name a service, an
+          # image, or a command - the far side decides all three.
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "$VPS_USER@$VPS_HOST" "$SHA"
+
+      - name: Report what was deployed
+        run: |
+          echo "root-vmi3536696-1788597274-30dab396 | $(date)"
+          echo "deployed ${{ env.IMAGE }}:${{ github.sha }}"
