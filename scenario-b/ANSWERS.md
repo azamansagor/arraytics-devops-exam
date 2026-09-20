@@ -380,3 +380,169 @@ and none of them is present.
 | `b1-task25-no-secrets.png` | the trap image: `/app` empty in the container, the password found in a layer; and this image clean of the real password |
 | `b1-task25-deleted-but-still-there.png` | the trap being built and the deleted file still recoverable |
 | `b1-task25-false-positive.png` | exactly which files the three hits came from, and the absence of `.env` and `.aws/` |
+
+---
+
+## B5 — CI/CD with GitHub Actions
+
+Two workflows, both with the exam token in a comment at the top:
+
+| File | Does | Status |
+| --- | --- | --- |
+| [`.github/workflows/release.yml`](../.github/workflows/release.yml) | builds and publishes to GHCR on push to `main` | active |
+| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | built, pushed to ECR and rolled the ECS service | reduced to `workflow_dispatch` after C5 deleted its targets |
+
+### Task 43 — The main branch pipeline
+
+`release.yml` runs on push to `main`, builds once, and publishes three tags:
+
+```
+ghcr.io/azamansagor/notes-api-zaman:<git sha>
+ghcr.io/azamansagor/notes-api-zaman:v1.1.<run number>
+ghcr.io/azamansagor/notes-api-zaman:latest
+```
+
+The SHA tag is the operational one. A running container can always be traced back to
+exactly one commit, which is what makes an incident answerable. The version tag is for
+people reading a changelog. `latest` is a convenience pointer and is deliberately **not**
+what the Swarm stack in B4 pins to — a service that follows `latest` cannot tell you what
+it is running, and has nothing specific to roll back to.
+
+#### No long-lived credentials, in either pipeline
+
+There is no `AWS_SECRET_ACCESS_KEY` and no static access key anywhere in this repository
+or its secrets. Both pipelines authenticate without one, by different mechanisms:
+
+| Pipeline | Registry | How it authenticates |
+| --- | --- | --- |
+| `release.yml` | GHCR | `GITHUB_TOKEN`, minted per run, scoped by the job's `permissions:` block to `contents: read` and `packages: write`, revoked when the job ends |
+| `deploy.yml` | ECR + ECS | GitHub OIDC — the job presents a signed identity token and AWS returns temporary credentials, with the trust policy restricting which repository and ref may ask |
+
+`GITHUB_TOKEN` is not a secret anyone stored. GitHub issues it for one run and invalidates
+it afterwards, so there is nothing to leak from the repository settings and nothing to
+replay tomorrow. The permissions block matters as much as the token: without it the
+default grant is much broader than `packages: write`.
+
+The brief says OIDC in Scenario C earns credit if it also works here. It does — `deploy.yml`
+used it for AWS, and the run that deployed `notes-api-zaman:3` printed
+`assumed-role/github-actions-deployer-zaman` as its identity. The write-up is in
+[`../scenario-c/ANSWERS.md`](../scenario-c/ANSWERS.md), Task 53, including the OIDC subject
+claim that cost the most time to get right.
+
+#### Multi-arch
+
+Skipped. `platforms: linux/amd64,linux/arm64` doubles build time and this image only ever
+runs on one x86_64 VPS and on Fargate's `X86_64` runtime platform, both of which are
+declared explicitly.
+
+It would matter the moment any of these is true: a developer on an Apple Silicon Mac wants
+to run the same image locally, deployment moves to Graviton instances for the ~20% price
+advantage, or the image ships to anyone whose architecture I do not control. All three are
+"pay later" situations rather than "never", which is why the Dockerfile declares
+`runtimePlatform` rather than leaving the architecture implicit — the assumption is written
+down where it will be found.
+
+### Task 42 — Caching
+
+Configured twice, measured each time, and the result is not the one the brief expects.
+
+| Backend | Cold | Warm | Cache hits |
+| --- | --- | --- | --- |
+| `type=gha` | **7s** | **14s** | none |
+| `type=registry` on GHCR | — | **13s** | 4 layers, including `npm ci` |
+
+*(times are the `Build and push` step, not the whole run, so runner setup and checkout do
+not blur the comparison)*
+
+**`type=gha` restored nothing.** Searching the warm run's build log for `CACHED` returned
+no results, while the export still ran — so the build went from 7s to 14s and got nothing
+back. Caching that silently restores nothing is worse than no caching, because you stop
+looking for the problem.
+
+**Registry cache works.** It writes to GHCR as a `buildcache` tag beside the image, so
+whether a cache exists is visible in the Packages tab rather than assumed. The warm run
+reports:
+
+```
+#11 importing cache manifest from ghcr.io/azamansagor/notes-api-zaman:buildcache
+#11 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done
+#12 [build 2/4] WORKDIR /app                                        CACHED
+#13 [build 3/4] COPY package.json package-lock.json ./              CACHED
+#14 [build 4/4] RUN npm ci --omit=dev                               CACHED
+#15 [runtime 3/5] COPY --from=build ... /app/node_modules           CACHED
+```
+
+`mode=max` rather than `mode=min` because this is a multi-stage build: `mode=min` exports
+only the final stage, which would drop the `npm ci` layer — the one layer actually worth
+caching.
+
+One misreading on the way: the first run after switching also showed no hits, which looked
+like another failure. It was not. Registry cache needs one run to write before any run can
+read, and that run was the writer.
+
+#### The improvement, stated honestly
+
+**There is no improvement.** 7s without a working cache against 13s with one.
+
+The brief's premise is that the first run is slow because it downloads all dependencies.
+That premise does not hold here: `npm ci` installs four packages and takes a few seconds,
+while the cache carries the whole layer graph including the ~180 MB base image. Transport
+costs more than the work it replaces.
+
+Caching pays when the cached work is expensive relative to moving the cache — a large
+dependency tree, native modules that compile, a multi-minute install. This project has
+none of those, and the honest result of measuring is that this optimisation is currently
+a pessimisation.
+
+The configuration stays, for one reason: the arithmetic reverses the moment a dependency
+with a native build step is added, and by then nobody will be measuring. What changed is
+that the assumption is now a number.
+
+**What to take from it:** verify a cache, do not configure it and assume. Two cheap checks
+— `CACHED` in the build log, and the cache artifact in the registry.
+
+### Task 46 — One safeguard
+
+Two, both in `release.yml` and `deploy.yml`, each commented in place with what it prevents.
+
+**Concurrency group.**
+
+```yaml
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+```
+
+The incident it prevents: two commits land on `main` within a minute of each other. Both
+runs start, both build, both push, and both move the `latest` tag. Whichever finishes last
+wins — **and that is not necessarily the newer commit**, because the older one may have a
+warmer cache and finish first. `latest` silently points at the earlier code while both
+runs show green, and the first sign of trouble is a bug reappearing in production that was
+fixed hours ago. The concurrency group serialises them, so ordering is the ordering of the
+commits.
+
+`cancel-in-progress` is left `false` deliberately. Cancelling a publish halfway can leave a
+manifest referencing layers that were never fully pushed; a slow queue is better than a
+corrupt tag.
+
+**Job timeout.** `timeout-minutes: 20` on `release.yml`, `30` on `deploy.yml`, the latter
+larger because `wait-for-service-stability` legitimately takes minutes while ECS seeds new
+tasks.
+
+Without it, a wedged step runs until GitHub's six-hour default. On its own that is only
+wasted minutes — but combined with the concurrency group it is an outage of the pipeline
+itself: the hung run holds the lock, and every subsequent deploy queues behind it for six
+hours. The two safeguards interact, which is why both have a bound.
+
+### Evidence
+
+| File | Shows |
+| --- | --- |
+| `b5-task43-ghcr-packages.png` | the public package with `latest`, `v1.1.2`, `v1.1.1` and SHA tags |
+| `b5-task43-no-static-credentials.png` | the GHCR login step using `GITHUB_TOKEN` under `packages: write` |
+| `b5-task42-cache-cold-vs-warm.png` | the run list with durations |
+| `b5-task42-cache-hits.png` | `Build and push` at 13s with the registry cache imported and four layers CACHED |
+
+### Not attempted
+
+Tasks 41, 44 and 45 are in [`../INCOMPLETE.md`](../INCOMPLETE.md).
