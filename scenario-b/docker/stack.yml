@@ -1,0 +1,108 @@
+# Exam token: root-vmi3536696-1788597274-30dab396
+#
+# Swarm stack for the Notes API.
+#
+#   export PG_PASS='<chosen at deploy time, never committed>'
+#   docker stack deploy -c scenario-b/docker/stack.yml notes
+#
+# The image comes from GHCR, published by .github/workflows/release.yml, so what
+# runs here is what CI built rather than something compiled by hand on the host.
+# It is pinned to a version tag and not to `latest`: a service following `latest`
+# cannot tell you which build it is running, and `docker service rollback` has
+# nothing specific to go back to.
+#
+# No depends_on anywhere - Swarm does not support it. That is not a gap to work
+# around here: the app opens its pool lazily and /healthz never touches the
+# database, so a replica is legitimately healthy before Postgres is ready and
+# starts serving as soon as it can.
+
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_DB: notesdb
+      # Interpolated from the deploying shell. The committed file holds the name
+      # of the variable, never the value.
+      POSTGRES_PASSWORD: ${PG_PASS}
+    volumes:
+      - notes-pgdata:/var/lib/postgresql/data
+    networks:
+      - notes-net
+    deploy:
+      replicas: 1
+      placement:
+        # One database, one node, one copy of the data. Scaling this service would
+        # start a second Postgres against the same volume and corrupt it.
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  app:
+    image: ghcr.io/azamansagor/notes-api-zaman:v1.1.5
+    environment:
+      PORT: "3000"
+      NODE_ENV: production
+      DB_HOST: db          # Swarm's internal DNS resolves the service name
+      DB_PORT: "5432"
+      DB_USER: notes
+      DB_NAME: notesdb
+      DB_PASSWORD: ${PG_PASS}
+    ports:
+      # 3110 on the host, per the shared-VPS convention in the root README.
+      # Swarm's routing mesh publishes this on every node and load balances
+      # across replicas wherever they run.
+      - "3110:3000"
+    networks:
+      - notes-net
+    deploy:
+      replicas: 3
+
+      update_config:
+        parallelism: 1
+        delay: 10s
+        # The setting Task 37 turns on. The default, stop-first, removes a
+        # replica before its replacement is ready, so at parallelism 1 there is
+        # always a window with one fewer replica serving. start-first brings the
+        # new task up, waits for it to pass its healthcheck, and only then stops
+        # the old one - which is what makes the update genuinely zero-downtime
+        # rather than merely quick.
+        order: start-first
+        # monitor is how long Swarm watches a new task before calling it good.
+        # Too short and a container that crashes on its second second counts as a
+        # success; the rollout finishes and every replica is broken.
+        monitor: 30s
+        failure_action: rollback
+
+      rollback_config:
+        parallelism: 1
+        order: start-first
+
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+      resources:
+        limits:
+          # A ceiling. Exceed the memory limit and the kernel kills the container
+          # with signal 9 - exit code 137.
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          # A promise made at scheduling time. Swarm will only place a task on a
+          # node that still has this much free; it does not reserve it from the
+          # kernel. Raise this above what any node has and tasks stay pending
+          # forever with "no suitable node" - which is Task 39.
+          cpus: "0.10"
+          memory: 128M
+
+networks:
+  notes-net:
+    driver: overlay
+
+volumes:
+  notes-pgdata:
