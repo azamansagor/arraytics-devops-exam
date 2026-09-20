@@ -1,0 +1,88 @@
+# Exam token: root-vmi3536696-1788597274-30dab396
+#
+# Main-branch pipeline: build the image once and publish it to GitHub Container
+# Registry, tagged with both the git SHA and a version. This is the registry the
+# Swarm stack in B4 pulls from, so what CI publishes is literally what runs.
+#
+# There are no static credentials. GITHUB_TOKEN is minted for this run, scoped by
+# the permissions block below, and expires when the job ends - it is not a secret
+# anyone stored, and it cannot be replayed tomorrow. The AWS pipeline in
+# deploy.yml made the same guarantee a different way, through OIDC.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Safeguard 1 (Task 46): one publish at a time. Two pushes landing together would
+# otherwise race to move the `latest` tag, and whichever finished last would win -
+# not necessarily the newer commit. Queueing makes the last commit win.
+# cancel-in-progress stays false: a half-pushed manifest is worse than a slow queue.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/notes-api-zaman
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    # Safeguard 2 (Task 46): a wedged build cannot hold the concurrency lock until
+    # GitHub's six-hour default and block every later release behind it.
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      packages: write # the only extra right this job gets
+
+    steps:
+      - name: Show exam token and time
+        run: echo "root-vmi3536696-1788597274-30dab396 | $(date)"
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Three tags on one build, as Task 43 asks for.
+      #
+      # The SHA tag is the one that matters operationally: it is unambiguous, so a
+      # running container can always be traced back to the exact commit. The version
+      # tag is for humans reading a changelog. `latest` is a convenience pointer and
+      # is deliberately not what the Swarm stack pins to - a service that follows
+      # `latest` has no way to tell you which build it is running, and no way back.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: scenario-b/app
+          file: scenario-b/docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:v1.1.${{ github.run_number }}
+            ${{ env.IMAGE }}:latest
+          # Task 42: the layer cache lives in GitHub's cache backend and survives
+          # between runs, so npm ci is not repeated when only source changed. The
+          # cold run pays for the dependency install; every warm run skips it.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report what was published
+        run: |
+          echo "root-vmi3536696-1788597274-30dab396 | $(date)"
+          echo "pushed:"
+          echo "  ${{ env.IMAGE }}:${{ github.sha }}"
+          echo "  ${{ env.IMAGE }}:v1.1.${{ github.run_number }}"
+          echo "  ${{ env.IMAGE }}:latest"
