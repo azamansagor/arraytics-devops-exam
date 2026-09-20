@@ -113,6 +113,12 @@ services:
 networks:
   notes-net:
     driver: overlay
+    # Stack-created overlay networks are not attachable by default, so a plain
+    # `docker run --network` is refused. It has to be attachable here because the
+    # traffic loop that measures the rolling update in Task 37 must outlive the
+    # containers being replaced - running it inside an app task would mean the
+    # loop is killed by the very update it is supposed to be observing.
+    attachable: true
 
 volumes:
   notes-pgdata:
