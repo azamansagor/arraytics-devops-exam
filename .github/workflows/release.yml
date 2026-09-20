@@ -73,11 +73,22 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:v1.1.${{ github.run_number }}
             ${{ env.IMAGE }}:latest
-          # Task 42: the layer cache lives in GitHub's cache backend and survives
-          # between runs, so npm ci is not repeated when only source changed. The
-          # cold run pays for the dependency install; every warm run skips it.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Task 42. First attempt used type=gha, GitHub's own cache backend. It
+          # produced no cache hits at all on the warm run - searching that run's
+          # build log for CACHED returns nothing - while still paying to export,
+          # so the build went from 7s to 14s. Configured caching that silently
+          # restores nothing is worse than none.
+          #
+          # Registry cache instead: the cache is written to GHCR as its own tag,
+          # alongside the image. It is visible in the Packages tab, so whether a
+          # cache exists is a fact rather than an assumption, and it uses the
+          # registry credentials this job already holds.
+          #
+          # mode=max because this is a multi-stage build: mode=min would export
+          # only the final stage and drop the npm ci layer, which is the one layer
+          # actually worth caching.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
       - name: Report what was published
         run: |
