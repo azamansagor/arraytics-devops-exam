@@ -146,3 +146,237 @@ zero-downtime rolling updates later.
 | --- | --- |
 | `b1-task21-nonroot.png` | token + date, `whoami` → `node`, `id` → uid 1000, no build tools |
 | `b1-task21-healthcheck.png` | token + date, `docker ps` showing `(healthy)`, and the health log with five `ExitCode: 0` entries |
+
+### Task 22 — Make it smaller
+
+Both measured with `docker image inspect --format '{{.Size}}'`, so the comparison is
+like for like:
+
+| Image | Size | `docker images` disk usage |
+| --- | --- | --- |
+| `notes-api-zaman:naive` | **394 MB** | 1.67 GB |
+| `notes-api-zaman:multi` | **58 MB** | 245 MB |
+| Reduction | **85%** | |
+
+Well past the 60% the task asks for. The two columns differ because `docker images` now
+reports extracted disk usage while `inspect .Size` reports the image content — a
+distinction that also came up in C2 Task 49, where ECR reported 61.6 MB against Docker's
+245 MB. Mixing the two would make any size claim meaningless, which is why one measure is
+used on both sides here.
+
+#### What was removed
+
+```
+$ docker run --rm notes-api-zaman:naive whoami
+root
+$ docker run --rm notes-api-zaman:naive sh -c 'which gcc make python3 git perl'
+/usr/bin/gcc
+/usr/bin/make
+/usr/bin/python3
+/usr/bin/git
+/usr/bin/perl
+
+$ docker run --rm notes-api-zaman:multi sh -c 'which gcc make python3 git perl || echo ...'
+none present
+```
+
+The saving is almost entirely the base image. `node:22` is Debian with a full toolchain —
+a C compiler, make, python3, git, perl, man pages, a package manager — none of which a
+running Node process uses. `node:22-alpine` is musl libc, busybox and Node. The build
+stage is also discarded: npm's cache and metadata stay behind in the stage that is thrown
+away, and only the resolved `node_modules` tree is copied forward.
+
+#### What was given up by removing it
+
+Smaller is not free, and these are the actual costs:
+
+| Lost | Consequence |
+| --- | --- |
+| Shell tooling — `curl`, `git`, `ps`, `vim`, `dig` | Debugging a live container is much harder. `docker exec` gets you busybox and little else, so investigating a wedged process means adding tooling to an image you were trying to keep small |
+| The C toolchain | Any dependency with a native addon will no longer build. Adding one means changing the base image, not just the lockfile |
+| glibc, in favour of musl | Prebuilt native binaries compiled against glibc do not run. This bites specific packages rather than most of them, but it bites silently at runtime rather than at build time |
+| root | Deliberate, and the point — but it does mean no `apk add` inside a running container during an incident |
+
+The honest summary: the multi-stage image is better to ship and worse to debug. That is
+usually the right trade, because debugging should happen against logs and metrics rather
+than by shelling into production — which is what B3 exists to make possible.
+
+### Task 23 — Layer caching
+
+```
+=== build 1 ===                          real  1m31.484s
+=== build 2: one comment added to server.js ===
+  CACHED [build 2/4] WORKDIR /app
+  CACHED [build 3/4] COPY package.json package-lock.json ./
+  CACHED [build 4/4] RUN npm ci --omit=dev
+  CACHED [runtime 3/5] COPY --from=build ... /app/node_modules
+  CACHED [runtime 4/5] COPY --chown=node:node package.json ./
+        [runtime 5/5] COPY --chown=node:node db.js s3.js server.js ...
+                                         real  0m26.977s
+```
+
+**91 seconds to 27 seconds**, and the rebuilt layers are exactly the ones that should be.
+
+Docker caches a layer on the instruction plus the checksum of whatever it copies in.
+Adding a comment to `server.js` changes the content of one `COPY`, so that layer and
+every layer after it are rebuilt, and everything before it is reused.
+
+This is why the Dockerfile copies `package.json` and `package-lock.json` on their own,
+before the source:
+
+```docker
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY db.js s3.js server.js migrate.js seed.js schema.sql ./
+```
+
+The install layer is keyed only on the manifests, so editing application code leaves it
+cached. `Dockerfile.naive` does the opposite with `COPY . .` before `npm install`, which
+puts the source checksum ahead of the install — every one-character change re-downloads
+every dependency. On a CI runner with a cold cache that is the difference between a
+30-second build and a five-minute one, on every commit.
+
+### Task 24 — The biggest layer
+
+```
+163MB   RUN addgroup -g 1000 node && adduser ... && apk add ... curl node-vX.tar.xz ... make install ...
+ 28MB   COPY --chown=node:node /app/node_modules ./node_modules
+9.08MB  ADD alpine-minirootfs-3.24.2-x86_64.tar.gz
+5.48MB  RUN apk add --virtual .build-deps-yarn ... yarn ...
+```
+
+**The biggest layer is 163 MB, and it is not one of mine.** It comes from the
+`node:22-alpine` base image: the layer that creates the `node` user, fetches the Node
+tarball, verifies its GPG signatures and installs the runtime. Of the ~245 MB on disk,
+about 178 MB is the base image before this application contributes anything.
+
+**Could it be smaller?** In principle, and not usefully:
+
+- **A distroless or scratch base** would drop busybox and the package manager. But it has
+  no shell, and the `HEALTHCHECK` depends on busybox `wget` — the healthcheck would have
+  to be rewritten as a Node one-liner, and debugging would become impossible rather than
+  merely awkward. A few tens of megabytes is not worth that.
+- **Dropping yarn** would save 5.48 MB. It is in the base image and this project uses npm,
+  so it is pure dead weight — but removing it means maintaining a custom base image, and
+  now every Node security update is my problem instead of Docker's.
+- **The 28 MB of `node_modules`** is the part I actually control, and most of it is
+  `@aws-sdk/client-s3`. Bundling with esbuild would tree-shake it substantially. That is
+  the one change with a real payoff, and it is a build-pipeline change rather than a
+  Dockerfile one.
+
+So the largest layer is also the least worth attacking: it is a dependency of the runtime
+itself, maintained and patched by someone else, and shared with every other image built
+from the same base — so on a host already running one `node:22-alpine` image it costs
+nothing extra at all.
+
+### Task 25 — No secrets in the image
+
+This took three attempts, and the first two were wrong in instructive ways.
+
+**Attempt 1 — checking the metadata.** Build history and baked-in environment:
+
+```
+=== build history ===        nothing
+=== baked-in environment === ["PATH=...","NODE_VERSION=22.23.2","YARN_VERSION=1.22.22",
+                              "NODE_ENV=production","PORT=3000"]
+```
+
+Clean, but this only proves nothing was passed as `ENV` or `ARG`. A file copied in would
+not appear here at all.
+
+**Attempt 2 — grepping the saved image, which proved nothing.** `docker save` produces a
+tar whose layer blobs are **gzip-compressed**, so a plain `grep` over the extracted
+archive cannot see file contents. It found nothing — and would have found nothing had the
+image been full of passwords. A negative result from a test that cannot produce a positive
+one is not evidence.
+
+**Attempt 3 — decompress each layer, and validate the scanner against a known-bad image.**
+
+```bash
+scan_image() {   # decompress every layer blob, then grep its contents
+  docker save "$1" | tar -x -C "$D"
+  for b in $(find "$D" -type f); do
+    tar -xzOf "$b" 2>/dev/null | grep -aq "$2" && echo "  FOUND in layer $(basename $b)"
+  done
+}
+```
+
+Built the trap from the brief — `COPY .env` then `RUN ... && rm /app/.env` — and ran the
+scanner against it:
+
+```
+=== trap-demo ===
+-- running container sees: --
+total 8
+drwxr-xr-x 1 root root 4096 .
+drwxr-xr-x 1 root root 4096 ..          <- /app is empty
+-- scanning its layers: --
+  FOUND in layer 37b67c81745ca5fcbeb380613d464f767233698432714ae138e6a7c721f5ea7b
+```
+
+The file is gone from the container and present in the image. That is the answer to why
+`rm` in a later layer does not help: **an image is a stack of layers, and a layer can only
+add.** Deleting a file writes a whiteout marker in the upper layer, which the union
+filesystem honours when assembling the container's view. The original layer is untouched,
+still shipped, still pulled by anyone with access to the image, and `docker save` hands it
+over in plain form. The only fixes are not to copy the secret in at all — multi-stage
+builds, `--mount=type=secret`, or runtime injection — or to squash the layers, which loses
+caching.
+
+**Then the same scanner against this image**, which is the part that matters:
+
+| Pattern | Result |
+| --- | --- |
+| `notes_local_dev` (the actual database password) | not found in any layer |
+| `supersecret` | not found in any layer |
+| `AWS_SECRET_ACCESS_KEY` | **found** |
+| `AKIA` | **found** |
+| `BEGIN PRIVATE KEY` | **found** |
+
+Three hits, and all three are false positives. Rather than assert that, here is where they
+live:
+
+```
+=== which files contain AKIA? ===
+/app/node_modules/@aws-sdk/nested-clients/dist-types/submodules/sts/commands/AssumeRoleWithWebIdentityCommand.d.ts
+/app/node_modules/@aws-sdk/nested-clients/dist-types/submodules/sts/commands/AssumeRoleCommand.d.ts
+/usr/local/lib/node_modules/corepack/dist/lib/corepack.cjs
+/usr/local/bin/node
+--- and what does the match look like? ---
+AKIA   AKIA0   AKIA06AAA   AKIA0GB   AKIA0Q
+
+=== which files contain BEGIN PRIVATE KEY? ===
+/usr/local/lib/node_modules/npm/man/man7/config.7
+/usr/local/lib/node_modules/npm/node_modules/@npmcli/config/lib/definitions/definitions.js
+/usr/local/lib/node_modules/npm/docs/content/using-npm/config.md
+/usr/local/lib/node_modules/npm/docs/output/using-npm/config.html
+
+=== and the things that would actually matter ===
+  no .env in the image
+  no .aws credentials directory
+```
+
+`AWS_SECRET_ACCESS_KEY` is the **name** of a variable the AWS SDK reads, written in its
+own source. The `AKIA` hits are TypeScript type documentation and coincidental byte
+sequences in the `node` binary — and none of the matched strings is a 20-character key
+ID. `BEGIN PRIVATE KEY` is npm's own documentation for its `key` and `cafile` options.
+
+The general lesson, and the reason this is worth writing down: **scanning an image for the
+names of secrets is the wrong test.** Every SDK that reads a credential contains the name
+of that credential, so the search is guaranteed to produce hits in any image with
+dependencies, and a reviewer who stops at "found" reaches the wrong conclusion. The useful
+searches are for secret **values**, for credential **shapes** (`AKIA` followed by sixteen
+uppercase characters, a PEM block with a body), and for the **paths** where credentials
+conventionally live — `.env`, `.aws/credentials`, `id_rsa`. Those are what were checked,
+and none of them is present.
+
+### Evidence
+
+| File | Shows |
+| --- | --- |
+| `b1-task22-size-comparison.png` | 394 MB against 58 MB, 85% saved, and the toolchain present in one image and absent from the other |
+| `b1-task23-layer-caching.png` | `1m31.484s` then `0m26.977s`, with `npm ci` CACHED and only the source `COPY` rebuilt |
+| `b1-task24-biggest-layer.png` | `docker history` with the 163 MB base-image Node install as the largest layer |
+| `b1-task25-no-secrets.png` | the trap image: `/app` empty in the container, the password found in a layer; and this image clean of the real password |
+| `b1-task25-deleted-but-still-there.png` | the trap being built and the deleted file still recoverable |
+| `b1-task25-false-positive.png` | exactly which files the three hits came from, and the absence of `.env` and `.aws/` |
